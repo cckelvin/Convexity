@@ -1,15 +1,23 @@
 """
 Convexity Native Built-ins
-Version 1.0.0
+Version: 1.2.0
 
 Native commands provided directly by Convexity.
 
 These commands do not depend on Bash, PowerShell, CMD, or Termux.
-They operate through Convexity's session, filesystem, and process layers.
+
+Built-ins operate through Convexity's own:
+- TerminalSession
+- Filesystem
+- ProcessManager
+- Maple session state
+
+The built-in layer does not create subprocesses directly.
 """
 
 from __future__ import annotations
 
+import getpass
 import os
 import platform
 from dataclasses import dataclass
@@ -35,108 +43,81 @@ from .filesystem import (
     is_directory,
 )
 
-from .environment import (
-    set_variable,
-    get_variable,
-    unset_variable,
-    expand_variables,
-    set_alias,
-    get_alias,
-    remove_alias,
-    context,
-)
-
 from .process import (
     process_manager,
     ProcessState,
 )
 
-from .job import (
-    job_manager,
-)
-
 from .session import TerminalSession
 
 
+__version__ = "1.2.0"
+
+
 # ============================================================================
-# RESULT
+# RESULT TYPES
 # ============================================================================
 
 @dataclass
 class BuiltinResult:
+    """
+    Result returned by a native Convexity built-in.
+    """
+
     handled: bool
+
     success: bool = True
+
     stdout: str = ""
+
     stderr: str = ""
+
     return_code: int = 0
 
 
 @dataclass
 class Builtin:
+    """
+    Registered Convexity built-in command.
+    """
+
     name: str
+
     handler: Callable
+
     description: str
 
 
 # ============================================================================
-# HELP
+# RESULT HELPERS
 # ============================================================================
 
-def builtin_help(args: list[str], **kwargs) -> BuiltinResult:
-    lines = [
-        "Convexity native commands:",
-        "",
-        "Navigation:",
-        "  cd <path>              Change directory",
-        "  pwd                    Show current directory",
-        "  ls [path]              List directory",
-        "",
-        "Files:",
-        "  cat <file>             Read file",
-        "  write <file> <text>    Write file",
-        "  append <file> <text>   Append to file",
-        "  touch <file>           Create file",
-        "  mkdir <path>           Create directory",
-        "  rm <path>              Delete file/directory",
-        "  cp <source> <dest>     Copy",
-        "  mv <source> <dest>     Move",
-        "",
-        "Search:",
-        "  find <path> [pattern]   Search files",
-        "  grep <text> [path]      Search file contents",
-        "",
-        "Environment:",
-        "  set [name] [value]      Set/list variables",
-        "  unset <name>            Remove variable",
-        "  env                     Show environment",
-        "  alias [name] [command]  Create/list aliases",
-        "  unalias <name>          Remove alias",
-        "",
-        "Processes:",
-        "  jobs                    Show jobs",
-        "  ps                      Show processes",
-        "  kill <pid>              Terminate process",
-        "  kill -9 <pid>           Force kill",
-        "",
-        "System:",
-        "  whoami                  Current user",
-        "  hostname                Computer name",
-        "  sysinfo                 System information",
-        "",
-        "Maple:",
-        "  load maple              Activate Maple",
-        "  kill maple              Deactivate Maple",
-        "",
-        "Shell:",
-        "  history                 Command history",
-        "  echo <text>             Print text",
-        "  clear                   Clear terminal",
-        "  exit                    Exit Convexity",
-    ]
-
+def _result(
+    stdout: str = "",
+    *,
+    success: bool = True,
+    stderr: str = "",
+    return_code: int = 0,
+) -> BuiltinResult:
     return BuiltinResult(
         handled=True,
-        stdout="\n".join(lines) + "\n",
+        success=success,
+        stdout=stdout,
+        stderr=stderr,
+        return_code=return_code,
+    )
+
+
+def _error(
+    command: str,
+    message: str,
+    return_code: int = 1,
+) -> BuiltinResult:
+    return BuiltinResult(
+        handled=True,
+        success=False,
+        stderr=f"{command}: {message}\n",
+        return_code=return_code,
     )
 
 
@@ -162,419 +143,833 @@ def _cwd(kwargs) -> str:
     return os.getcwd()
 
 
-def _resolve_path(path: str, kwargs) -> str:
+def _resolve_path(
+    path: str,
+    kwargs,
+) -> str:
     """
     Resolve a path relative to the Convexity session.
 
-    Does not change the process-wide working directory.
+    This function never calls os.chdir().
     """
 
-    path = expand_variables(path)
+    path = os.path.expandvars(path)
+    path = os.path.expanduser(path)
 
     session = _get_session(kwargs)
 
-    if session is not None:
-        if os.path.isabs(path):
-            return os.path.normpath(path)
+    if session is None:
+        return os.path.abspath(path)
 
-        return os.path.normpath(
-            os.path.join(session.cwd, path)
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+
+    return os.path.normpath(
+        os.path.join(
+            session.cwd,
+            path,
+        )
+    )
+
+
+def _require_session(
+    command: str,
+    kwargs,
+) -> Optional[BuiltinResult]:
+    if _get_session(kwargs) is None:
+        return _error(
+            command,
+            "No terminal session is attached.",
         )
 
-    return os.path.abspath(path)
+    return None
+
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+def builtin_help(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    lines = [
+        "Convexity native commands:",
+        "",
+        "Navigation:",
+        "  cd <path>               Change session directory",
+        "  pwd                     Show current directory",
+        "  ls [path]               List directory",
+        "",
+        "Files:",
+        "  cat <file>              Read file",
+        "  read <file>             Read file",
+        "  write <file> <text>     Write file",
+        "  append <file> <text>    Append to file",
+        "  touch <file>            Create file",
+        "  mkdir <path>            Create directory",
+        "  rm <path>               Delete file/directory",
+        "  del <path>              Delete file/directory",
+        "  cp <source> <dest>      Copy",
+        "  copy <source> <dest>    Copy",
+        "  mv <source> <dest>      Move",
+        "  move <source> <dest>    Move",
+        "  stat <path>             Show file information",
+        "  exists <path>           Check whether path exists",
+        "",
+        "Search:",
+        "  find <path> [pattern]   Search files",
+        "  grep <text> [path]      Search file contents",
+        "",
+        "Environment:",
+        "  set [name] [value]      Set/list session variable",
+        "  unset <name>            Remove variable",
+        "  env                     Show session environment",
+        "  alias [name] [command]  Create/list aliases",
+        "  unalias <name>          Remove alias",
+        "",
+        "Processes:",
+        "  jobs                    Show managed processes",
+        "  ps                      Show managed processes",
+        "  kill <id>               Terminate process",
+        "  kill -9 <id>            Force kill process",
+        "",
+        "System:",
+        "  whoami                  Current user",
+        "  hostname                Computer name",
+        "  sysinfo                 System information",
+        "",
+        "Maple:",
+        "  load maple              Activate Maple",
+        "  kill maple              Deactivate Maple",
+        "",
+        "Shell:",
+        "  history                 Command history",
+        "  echo <text>             Print text",
+        "  clear                   Clear terminal",
+        "  exit                    Exit Convexity",
+    ]
+
+    return _result(
+        "\n".join(lines) + "\n"
+    )
 
 
 # ============================================================================
 # NAVIGATION
 # ============================================================================
 
-def builtin_pwd(args: list[str], **kwargs) -> BuiltinResult:
-    return BuiltinResult(
-        handled=True,
-        stdout=_cwd(kwargs) + "\n",
+def builtin_pwd(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    return _result(
+        _cwd(kwargs) + "\n"
     )
 
 
-def builtin_cd(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_cd(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     session = _get_session(kwargs)
 
-    path = args[0] if args else os.path.expanduser("~")
-
-    target = _resolve_path(path, kwargs)
-
-    if not os.path.isdir(target):
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"cd: not a directory: {path}\n",
-            return_code=1,
+    if session is None:
+        return _error(
+            "cd",
+            "No terminal session is attached.",
         )
 
-    if session is not None:
-        session.cwd = target
-    else:
-        # Fallback only when no Convexity session exists.
-        os.chdir(target)
-
-    return BuiltinResult(
-        handled=True,
-        stdout=target + "\n",
+    path = (
+        args[0]
+        if args
+        else "~"
     )
 
+    try:
+        target = _resolve_path(
+            path,
+            kwargs,
+        )
 
-def builtin_ls(args: list[str], **kwargs) -> BuiltinResult:
+        new_directory = session.change_directory(
+            target
+        )
+
+        return _result(
+            str(new_directory) + "\n"
+        )
+
+    except Exception as exc:
+        return _error(
+            "cd",
+            str(exc),
+        )
+
+
+def builtin_ls(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     path = "."
+
     show_hidden = False
+
     recursive = False
 
     for arg in args:
-        if arg in ("-a", "--all"):
+
+        if arg in (
+            "-a",
+            "--all",
+        ):
             show_hidden = True
-        elif arg in ("-r", "--recursive"):
+
+        elif arg in (
+            "-r",
+            "--recursive",
+        ):
             recursive = True
-        else:
+
+        elif not arg.startswith("-"):
             path = arg
 
-    target = _resolve_path(path, kwargs)
+    target = _resolve_path(
+        path,
+        kwargs,
+    )
 
     try:
+
         entries = list_directory(
             target,
             show_hidden=show_hidden,
             recursive=recursive,
         )
 
-        lines = []
+        lines: list[str] = []
 
         for entry in entries:
-            if hasattr(entry, "name"):
-                name = entry.name
 
-                if getattr(entry, "is_directory", False):
-                    name += "/"
-
-                lines.append(name)
-            else:
-                lines.append(str(entry))
-
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
-        )
-
-    except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"ls: {exc}\n",
-            return_code=1,
-        )
-
-
-# ============================================================================
-# FILE COMMANDS
-# ============================================================================
-
-def builtin_cat(args: list[str], **kwargs) -> BuiltinResult:
-    if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="cat: missing file\n",
-            return_code=1,
-        )
-
-    output = []
-
-    try:
-        for path in args:
-            target = _resolve_path(path, kwargs)
-            output.append(read_file(target))
-
-        return BuiltinResult(
-            handled=True,
-            stdout="".join(output),
-        )
-
-    except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"cat: {exc}\n",
-            return_code=1,
-        )
-
-
-def builtin_touch(args: list[str], **kwargs) -> BuiltinResult:
-    if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="touch: missing file\n",
-            return_code=1,
-        )
-
-    try:
-        for path in args:
-            touch_file(
-                _resolve_path(path, kwargs)
+            name = getattr(
+                entry,
+                "name",
+                None,
             )
 
-        return BuiltinResult(handled=True)
+            if name is None:
+                lines.append(str(entry))
+                continue
+
+            is_directory = getattr(
+                entry,
+                "is_directory",
+                False,
+            )
+
+            if callable(is_directory):
+                try:
+                    is_directory = is_directory()
+                except Exception:
+                    is_directory = False
+
+            if is_directory:
+                name += "/"
+
+            lines.append(name)
+
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"touch: {exc}\n",
-            return_code=1,
+        return _error(
+            "ls",
+            str(exc),
         )
 
 
-def builtin_mkdir(args: list[str], **kwargs) -> BuiltinResult:
+# ============================================================================
+# FILE READING
+# ============================================================================
+
+def builtin_cat(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="mkdir: missing directory\n",
-            return_code=1,
+        return _error(
+            "cat",
+            "missing file",
+        )
+
+    output: list[str] = []
+
+    try:
+
+        for path in args:
+
+            target = _resolve_path(
+                path,
+                kwargs,
+            )
+
+            output.append(
+                read_file(target)
+            )
+
+        return _result(
+            "".join(output)
+        )
+
+    except Exception as exc:
+        return _error(
+            "cat",
+            str(exc),
+        )
+
+
+builtin_read = builtin_cat
+
+
+# ============================================================================
+# FILE CREATION
+# ============================================================================
+
+def builtin_touch(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    if not args:
+        return _error(
+            "touch",
+            "missing file",
         )
 
     try:
+
         for path in args:
+
+            touch_file(
+                _resolve_path(
+                    path,
+                    kwargs,
+                )
+            )
+
+        return _result()
+
+    except Exception as exc:
+        return _error(
+            "touch",
+            str(exc),
+        )
+
+
+def builtin_mkdir(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    if not args:
+        return _error(
+            "mkdir",
+            "missing directory",
+        )
+
+    try:
+
+        for path in args:
+
             make_directory(
-                _resolve_path(path, kwargs),
+                _resolve_path(
+                    path,
+                    kwargs,
+                ),
                 parents=True,
             )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"mkdir: {exc}\n",
-            return_code=1,
+        return _error(
+            "mkdir",
+            str(exc),
         )
 
 
-def builtin_write(args: list[str], **kwargs) -> BuiltinResult:
+# ============================================================================
+# FILE WRITING
+# ============================================================================
+
+def builtin_write(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if len(args) < 2:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="write: usage: write <file> <text>\n",
-            return_code=1,
+        return _error(
+            "write",
+            "usage: write <file> <text>",
         )
 
-    target = _resolve_path(args[0], kwargs)
-    text = " ".join(args[1:])
+    target = _resolve_path(
+        args[0],
+        kwargs,
+    )
+
+    text = " ".join(
+        args[1:]
+    )
+
+    confirmed = bool(
+        kwargs.get(
+            "confirmed",
+            False,
+        )
+    )
+
+    source = kwargs.get(
+        "source",
+        "human",
+    )
 
     try:
+
         write_file(
             target,
             text,
+            source=source,
+            confirmed=confirmed,
         )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"write: {exc}\n",
-            return_code=1,
+        return _error(
+            "write",
+            str(exc),
         )
 
 
-def builtin_append(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_append(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if len(args) < 2:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="append: usage: append <file> <text>\n",
-            return_code=1,
+        return _error(
+            "append",
+            "usage: append <file> <text>",
         )
 
-    target = _resolve_path(args[0], kwargs)
-    text = " ".join(args[1:])
+    target = _resolve_path(
+        args[0],
+        kwargs,
+    )
+
+    text = " ".join(
+        args[1:]
+    )
+
+    confirmed = bool(
+        kwargs.get(
+            "confirmed",
+            False,
+        )
+    )
+
+    source = kwargs.get(
+        "source",
+        "human",
+    )
 
     try:
+
         append_file(
             target,
             text,
+            source=source,
+            confirmed=confirmed,
         )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"append: {exc}\n",
-            return_code=1,
+        return _error(
+            "append",
+            str(exc),
         )
 
 
-def builtin_rm(args: list[str], **kwargs) -> BuiltinResult:
+# ============================================================================
+# DELETE
+# ============================================================================
+
+def builtin_rm(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="rm: missing path\n",
-            return_code=1,
+        return _error(
+            "rm",
+            "missing path",
         )
 
     recursive = False
-    targets = []
+
+    targets: list[str] = []
 
     for arg in args:
-        if arg in ("-r", "-R", "--recursive"):
+
+        if arg in (
+            "-r",
+            "-R",
+            "--recursive",
+        ):
             recursive = True
+
         else:
             targets.append(arg)
 
+    if not targets:
+        return _error(
+            "rm",
+            "missing path",
+        )
+
+    confirmed = bool(
+        kwargs.get(
+            "confirmed",
+            False,
+        )
+    )
+
+    source = kwargs.get(
+        "source",
+        "human",
+    )
+
     try:
+
         for path in targets:
+
             delete_path(
-                _resolve_path(path, kwargs),
+                _resolve_path(
+                    path,
+                    kwargs,
+                ),
                 recursive=recursive,
-                confirmed=kwargs.get("confirmed", False),
+                source=source,
+                confirmed=confirmed,
             )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"rm: {exc}\n",
-            return_code=1,
+        return _error(
+            "rm",
+            str(exc),
         )
 
 
-def builtin_cp(args: list[str], **kwargs) -> BuiltinResult:
+builtin_del = builtin_rm
+
+
+# ============================================================================
+# COPY
+# ============================================================================
+
+def builtin_cp(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if len(args) < 2:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="cp: usage: cp <source> <destination>\n",
-            return_code=1,
+        return _error(
+            "cp",
+            "usage: cp <source> <destination>",
         )
+
+    confirmed = bool(
+        kwargs.get(
+            "confirmed",
+            False,
+        )
+    )
+
+    source = kwargs.get(
+        "source",
+        "human",
+    )
 
     try:
+
         copy_path(
-            _resolve_path(args[0], kwargs),
-            _resolve_path(args[1], kwargs),
+            _resolve_path(
+                args[0],
+                kwargs,
+            ),
+            _resolve_path(
+                args[1],
+                kwargs,
+            ),
+            source=source,
+            confirmed=confirmed,
         )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"cp: {exc}\n",
-            return_code=1,
+        return _error(
+            "cp",
+            str(exc),
         )
 
 
-def builtin_mv(args: list[str], **kwargs) -> BuiltinResult:
+builtin_copy = builtin_cp
+
+
+# ============================================================================
+# MOVE
+# ============================================================================
+
+def builtin_mv(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if len(args) < 2:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="mv: usage: mv <source> <destination>\n",
-            return_code=1,
+        return _error(
+            "mv",
+            "usage: mv <source> <destination>",
         )
+
+    confirmed = bool(
+        kwargs.get(
+            "confirmed",
+            False,
+        )
+    )
+
+    source = kwargs.get(
+        "source",
+        "human",
+    )
 
     try:
+
         move_path(
-            _resolve_path(args[0], kwargs),
-            _resolve_path(args[1], kwargs),
+            _resolve_path(
+                args[0],
+                kwargs,
+            ),
+            _resolve_path(
+                args[1],
+                kwargs,
+            ),
+            source=source,
+            confirmed=confirmed,
         )
 
-        return BuiltinResult(handled=True)
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"mv: {exc}\n",
-            return_code=1,
+        return _error(
+            "mv",
+            str(exc),
         )
+
+
+builtin_move = builtin_mv
 
 
 # ============================================================================
 # SEARCH
 # ============================================================================
 
-def builtin_find(args: list[str], **kwargs) -> BuiltinResult:
-    path = args[0] if args else "."
-    pattern = args[1] if len(args) > 1 else "*"
+def builtin_find(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    path = (
+        args[0]
+        if args
+        else "."
+    )
+
+    pattern = (
+        args[1]
+        if len(args) > 1
+        else "*"
+    )
 
     try:
+
         results = search_files(
-            _resolve_path(path, kwargs),
+            _resolve_path(
+                path,
+                kwargs,
+            ),
             pattern=pattern,
         )
 
-        lines = [str(item) for item in results]
+        lines = [
+            str(item)
+            for item in results
+        ]
 
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
-        )
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"find: {exc}\n",
-            return_code=1,
+        return _error(
+            "find",
+            str(exc),
         )
 
 
-def builtin_grep(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_grep(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="grep: missing search text\n",
-            return_code=1,
+        return _error(
+            "grep",
+            "missing search text",
         )
 
     text = args[0]
-    path = args[1] if len(args) > 1 else "."
+
+    path = (
+        args[1]
+        if len(args) > 1
+        else "."
+    )
 
     try:
+
         results = find_text(
-            _resolve_path(path, kwargs),
+            _resolve_path(
+                path,
+                kwargs,
+            ),
             text,
         )
 
-        lines = [str(item) for item in results]
+        lines = [
+            f"{item[0]}:{item[1]}:{item[2]}"
+            for item in results
+        ]
 
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
+
+    except Exception as exc:
+        return _error(
+            "grep",
+            str(exc),
+        )
+
+
+# ============================================================================
+# FILE INFORMATION
+# ============================================================================
+
+def builtin_stat(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    if not args:
+        return _error(
+            "stat",
+            "missing path",
+        )
+
+    target = _resolve_path(
+        args[0],
+        kwargs,
+    )
+
+    try:
+
+        info = get_file_info(
+            target
+        )
+
+        lines = [
+            f"path: {info.path}",
+            f"name: {info.name}",
+            f"type: {info.type}",
+            f"size: {info.size}",
+            f"modified: {info.modified}",
+            f"permissions: {info.permissions}",
+            f"hidden: {info.hidden}",
+        ]
+
+        return _result(
+            "\n".join(lines) + "\n"
         )
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"grep: {exc}\n",
-            return_code=1,
+        return _error(
+            "stat",
+            str(exc),
+        )
+
+
+def builtin_exists(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    if not args:
+        return _error(
+            "exists",
+            "missing path",
+        )
+
+    target = _resolve_path(
+        args[0],
+        kwargs,
+    )
+
+    try:
+
+        return _result(
+            (
+                "true"
+                if exists(target)
+                else "false"
+            )
+            + "\n"
+        )
+
+    except Exception as exc:
+        return _error(
+            "exists",
+            str(exc),
         )
 
 
@@ -582,794 +977,970 @@ def builtin_grep(args: list[str], **kwargs) -> BuiltinResult:
 # ENVIRONMENT
 # ============================================================================
 
-def builtin_set(args: list[str], **kwargs) -> BuiltinResult:
+def _session_environment(
+    session: TerminalSession,
+) -> dict[str, str]:
+
+    result: dict[str, str] = {}
+
+    try:
+
+        exported = session.export_environment()
+
+        if isinstance(exported, dict):
+            for key, value in exported.items():
+                result[str(key)] = str(value)
+
+            return result
+
+    except Exception:
+        pass
+
+    return result
+
+
+def builtin_set(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "set",
+            "No terminal session is attached.",
+        )
+
     if not args:
-        variables = context.environment.list_variables()
+
+        variables = _session_environment(
+            session
+        )
 
         lines = [
             f"{key}={value}"
-            for key, value in variables.items()
+            for key, value in sorted(
+                variables.items()
+            )
         ]
 
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
-        )
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
 
     name = args[0]
-    value = " ".join(args[1:]) if len(args) > 1 else ""
 
-    result = set_variable(
-        name,
-        expand_variables(value),
+    if not name:
+        return _error(
+            "set",
+            "invalid variable name",
+        )
+
+    value = (
+        " ".join(args[1:])
+        if len(args) > 1
+        else ""
     )
 
-    if not result.success:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=result.error + "\n",
-            return_code=1,
+    try:
+
+        session.set_env(
+            name,
+            value,
         )
 
-    return BuiltinResult(handled=True)
+        return _result()
+
+    except Exception as exc:
+        return _error(
+            "set",
+            str(exc),
+        )
 
 
-def builtin_unset(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_unset(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "unset",
+            "No terminal session is attached.",
+        )
+
     if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="unset: missing variable\n",
-            return_code=1,
+        return _error(
+            "unset",
+            "missing variable",
         )
 
-    result = unset_variable(args[0])
+    try:
 
-    if not result.success:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=result.error + "\n",
-            return_code=1,
+        session.unset_env(
+            args[0]
         )
 
-    return BuiltinResult(handled=True)
+        return _result()
+
+    except Exception as exc:
+        return _error(
+            "unset",
+            str(exc),
+        )
 
 
-def builtin_env(args: list[str], **kwargs) -> BuiltinResult:
-    variables = context.environment.list_variables()
+def builtin_env(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "env",
+            "No terminal session is attached.",
+        )
+
+    variables = _session_environment(
+        session
+    )
 
     lines = [
         f"{key}={value}"
-        for key, value in variables.items()
+        for key, value in sorted(
+            variables.items()
+        )
     ]
 
-    return BuiltinResult(
-        handled=True,
-        stdout=(
-            "\n".join(lines)
-            + ("\n" if lines else "")
-        ),
-    )
+    output = "\n".join(lines)
+
+    if output:
+        output += "\n"
+
+    return _result(output)
 
 
 # ============================================================================
 # ALIASES
 # ============================================================================
 
-def builtin_alias(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_alias(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "alias",
+            "No terminal session is attached.",
+        )
+
     if not args:
-        aliases = context.environment.list_aliases()
 
-        lines = [
-            f"{name}={command}"
-            for name, command in aliases.items()
-        ]
+        try:
+            aliases = session.list_aliases()
 
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
-        )
+            lines = [
+                f"{name}={value}"
+                for name, value in sorted(
+                    aliases.items()
+                )
+            ]
 
-    if len(args) < 2:
-        existing = get_alias(args[0])
+            output = "\n".join(lines)
 
-        if existing is None:
-            return BuiltinResult(
-                handled=True,
-                success=False,
-                stderr=f"alias: not found: {args[0]}\n",
-                return_code=1,
+            if output:
+                output += "\n"
+
+            return _result(output)
+
+        except Exception as exc:
+            return _error(
+                "alias",
+                str(exc),
             )
-
-        return BuiltinResult(
-            handled=True,
-            stdout=f"{args[0]}={existing}\n",
-        )
 
     name = args[0]
-    command = " ".join(args[1:])
 
-    result = set_alias(
-        name,
-        command,
-    )
+    if len(args) == 1:
 
-    if not result.success:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=result.error + "\n",
-            return_code=1,
-        )
+        try:
 
-    return BuiltinResult(handled=True)
-
-
-def builtin_unalias(args: list[str], **kwargs) -> BuiltinResult:
-    if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="unalias: missing name\n",
-            return_code=1,
-        )
-
-    result = remove_alias(args[0])
-
-    if not result.success:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=result.error + "\n",
-            return_code=1,
-        )
-
-    return BuiltinResult(handled=True)
-# ============================================================================
-# PROCESS / JOB COMMANDS
-# ============================================================================
-
-def builtin_jobs(args: list[str], **kwargs) -> BuiltinResult:
-    try:
-        jobs = job_manager.list_jobs(
-            include_finished=False
-        )
-
-        if not jobs:
-            return BuiltinResult(
-                handled=True,
-                stdout="No active jobs.\n",
+            value = session.get_alias(
+                name
             )
 
-        lines = [
-            "JOB ID       PID        STATE        COMMAND"
-        ]
-
-        for job in jobs:
-            process = getattr(job, "process", None)
-
-            pid = getattr(
-                process,
-                "pid",
-                getattr(job, "pid", "?"),
-            )
-
-            state = getattr(
-                process,
-                "state",
-                getattr(job, "state", "?"),
-            )
-
-            command = getattr(
-                process,
-                "command",
-                getattr(job, "command", ""),
-            )
-
-            if isinstance(command, (list, tuple)):
-                command = " ".join(
-                    str(item) for item in command
+            if value is None:
+                return _error(
+                    "alias",
+                    f"alias not found: {name}",
                 )
 
-            lines.append(
-                f"{getattr(job, 'id', '?'):<12}"
-                f"{str(pid):<11}"
-                f"{str(state):<13}"
-                f"{command}"
+            return _result(
+                f"{name}={value}\n"
             )
 
-        return BuiltinResult(
-            handled=True,
-            stdout="\n".join(lines) + "\n",
+        except Exception as exc:
+            return _error(
+                "alias",
+                str(exc),
+            )
+
+    value = " ".join(
+        args[1:]
+    )
+
+    try:
+
+        session.set_alias(
+            name,
+            value,
         )
+
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"jobs: {exc}\n",
-            return_code=1,
+        return _error(
+            "alias",
+            str(exc),
         )
 
 
-def builtin_ps(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_unalias(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "unalias",
+            "No terminal session is attached.",
+        )
+
+    if not args:
+        return _error(
+            "unalias",
+            "missing alias",
+        )
+
     try:
+
+        removed = session.remove_alias(
+            args[0]
+        )
+
+        if removed is False:
+            return _error(
+                "unalias",
+                f"alias not found: {args[0]}",
+            )
+
+        return _result()
+
+    except Exception as exc:
+        return _error(
+            "unalias",
+            str(exc),
+        )
+
+
+# ============================================================================
+# PROCESS MANAGEMENT
+# ============================================================================
+
+def builtin_jobs(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    try:
+
         processes = process_manager.list(
             include_finished=False
         )
 
-        if not processes:
-            return BuiltinResult(
-                handled=True,
-                stdout="No active processes.\n",
-            )
+        lines: list[str] = []
 
-        lines = [
-            "ID                         PID        STATE        COMMAND"
-        ]
+        for process in processes:
 
-        for info in processes:
-            process_id = getattr(
-                info,
-                "id",
-                getattr(info, "process_id", "?"),
-            )
-
-            pid = getattr(
-                info,
-                "pid",
-                "?",
-            )
-
-            state = getattr(
-                info,
-                "state",
-                "?",
-            )
-
-            command = getattr(
-                info,
-                "command",
-                "",
-            )
-
-            if isinstance(command, (list, tuple)):
-                command = " ".join(
-                    str(item) for item in command
-                )
+            info = process.info()
 
             lines.append(
-                f"{str(process_id):<27}"
-                f"{str(pid):<11}"
-                f"{str(state):<13}"
-                f"{command}"
+                f"[{info.process_id}] "
+                f"{info.state.value} "
+                f"pid={info.pid} "
+                f"{info.command}"
             )
 
-        return BuiltinResult(
-            handled=True,
-            stdout="\n".join(lines) + "\n",
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
+
+    except Exception as exc:
+        return _error(
+            "jobs",
+            str(exc),
+        )
+
+
+def builtin_ps(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    include_finished = any(
+        arg in (
+            "-a",
+            "--all",
+        )
+        for arg in args
+    )
+
+    try:
+
+        processes = process_manager.list(
+            include_finished=include_finished
+        )
+
+        lines: list[str] = []
+
+        for process in processes:
+
+            info = process.info()
+
+            lines.append(
+                f"{info.process_id:<6} "
+                f"{info.pid:<8} "
+                f"{info.state.value:<12} "
+                f"{info.command}"
+            )
+
+        if not lines:
+            return _result()
+
+        header = (
+            "ID     PID      STATE        COMMAND\n"
+        )
+
+        return _result(
+            header
+            + "\n".join(lines)
+            + "\n"
         )
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"ps: {exc}\n",
-            return_code=1,
+        return _error(
+            "ps",
+            str(exc),
         )
 
 
-def _find_process(identifier: str):
-    """
-    Resolve either a Convexity process ID or an OS PID.
-    """
+def builtin_kill(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-    process = process_manager.get(identifier)
-
-    if process is not None:
-        return process
-
-    try:
-        pid = int(identifier)
-    except ValueError:
-        return None
-
-    for info in process_manager.list(
-        include_finished=True
-    ):
-        if getattr(info, "pid", None) == pid:
-            process_id = getattr(
-                info,
-                "id",
-                getattr(info, "process_id", None),
-            )
-
-            if process_id is not None:
-                return process_manager.get(process_id)
-
-    return None
-
-
-def builtin_kill(args: list[str], **kwargs) -> BuiltinResult:
     if not args:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="kill: missing process ID\n",
-            return_code=1,
+        return _error(
+            "kill",
+            "missing process id",
         )
 
     force = False
-    identifier = None
+
+    target = None
 
     for arg in args:
-        if arg in ("-9", "--force"):
+
+        if arg in (
+            "-9",
+            "--force",
+        ):
             force = True
-        elif identifier is None:
-            identifier = arg
+            continue
 
-    if identifier is None:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="kill: missing process ID\n",
-            return_code=1,
-        )
+        if target is None:
+            target = arg
 
-    process = _find_process(identifier)
-
-    if process is None:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"kill: process not found: {identifier}\n",
-            return_code=1,
+    if target is None:
+        return _error(
+            "kill",
+            "missing process id",
         )
 
     try:
+
+        process_id = int(target)
+
+    except ValueError:
+        return _error(
+            "kill",
+            "process id must be an integer",
+        )
+
+    try:
+
         if force:
-            process_manager.kill(
-                getattr(
-                    process,
-                    "id",
-                    identifier,
-                )
+
+            success = process_manager.kill(
+                process_id
             )
+
         else:
-            process_manager.terminate(
-                getattr(
-                    process,
-                    "id",
-                    identifier,
-                )
+
+            success = process_manager.terminate(
+                process_id
             )
 
-        return BuiltinResult(handled=True)
+        if not success:
+            return _error(
+                "kill",
+                f"process not found or already finished: {process_id}",
+            )
+
+        return _result()
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"kill: {exc}\n",
-            return_code=1,
+        return _error(
+            "kill",
+            str(exc),
         )
 
 
 # ============================================================================
-# SYSTEM INFORMATION
+# SYSTEM
 # ============================================================================
 
-def builtin_whoami(args: list[str], **kwargs) -> BuiltinResult:
-    try:
-        import getpass
+def builtin_whoami(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-        return BuiltinResult(
-            handled=True,
-            stdout=getpass.getuser() + "\n",
+    try:
+
+        return _result(
+            getpass.getuser() + "\n"
         )
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"whoami: {exc}\n",
-            return_code=1,
+        return _error(
+            "whoami",
+            str(exc),
         )
 
 
-def builtin_hostname(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_hostname(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     try:
-        return BuiltinResult(
-            handled=True,
-            stdout=platform.node() + "\n",
+
+        return _result(
+            platform.node() + "\n"
         )
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"hostname: {exc}\n",
-            return_code=1,
+        return _error(
+            "hostname",
+            str(exc),
         )
 
 
-def builtin_sysinfo(args: list[str], **kwargs) -> BuiltinResult:
+def builtin_sysinfo(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
     lines = [
-        f"System:       {platform.system()}",
-        f"Release:      {platform.release()}",
-        f"Version:      {platform.version()}",
-        f"Machine:      {platform.machine()}",
-        f"Architecture: {platform.architecture()[0]}",
-        f"Processor:    {platform.processor()}",
-        f"Python:       {platform.python_version()}",
-        f"Directory:    {_cwd(kwargs)}",
+        f"system: {platform.system()}",
+        f"release: {platform.release()}",
+        f"version: {platform.version()}",
+        f"machine: {platform.machine()}",
+        f"processor: {platform.processor()}",
+        f"python: {platform.python_version()}",
+        f"cwd: {_cwd(kwargs)}",
     ]
 
-    return BuiltinResult(
-        handled=True,
-        stdout="\n".join(lines) + "\n",
+    return _result(
+        "\n".join(lines) + "\n"
     )
 
 
 # ============================================================================
-# SHELL UTILITIES
+# MAPLE
 # ============================================================================
 
-def builtin_echo(args: list[str], **kwargs) -> BuiltinResult:
-    return BuiltinResult(
-        handled=True,
-        stdout=" ".join(args) + "\n",
-    )
+def builtin_load_maple(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-
-def builtin_clear(args: list[str], **kwargs) -> BuiltinResult:
-    return BuiltinResult(
-        handled=True,
-        stdout="\033[2J\033[H",
-    )
-
-
-def builtin_history(args: list[str], **kwargs) -> BuiltinResult:
     session = _get_session(kwargs)
 
     if session is None:
-        return BuiltinResult(
-            handled=True,
-            stderr="history: no active session\n",
-            success=False,
-            return_code=1,
+        return _error(
+            "load maple",
+            "No terminal session is attached.",
         )
 
     try:
-        entries = session.get_history()
 
-        lines = []
+        maple_session_id = kwargs.get(
+            "maple_session_id"
+        )
 
-        for index, entry in enumerate(entries, start=1):
+        session.load_maple(
+            maple_session_id=maple_session_id
+        )
+
+        return _result(
+            "Maple loaded.\n"
+        )
+
+    except Exception as exc:
+        return _error(
+            "load maple",
+            str(exc),
+        )
+
+
+def builtin_kill_maple(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "kill maple",
+            "No terminal session is attached.",
+        )
+
+    try:
+
+        session.kill_maple()
+
+        return _result(
+            "Maple unloaded.\n"
+        )
+
+    except Exception as exc:
+        return _error(
+            "kill maple",
+            str(exc),
+        )
+
+
+# ============================================================================
+# HISTORY
+# ============================================================================
+
+def builtin_history(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
+
+    session = _get_session(kwargs)
+
+    if session is None:
+        return _error(
+            "history",
+            "No terminal session is attached.",
+        )
+
+    limit: Optional[int] = None
+
+    if args:
+
+        try:
+            limit = int(args[0])
+
+        except ValueError:
+            return _error(
+                "history",
+                "limit must be an integer",
+            )
+
+    try:
+
+        entries = session.get_history(
+            limit=limit
+        )
+
+        lines: list[str] = []
+
+        for index, entry in enumerate(
+            entries,
+            start=1,
+        ):
+
             command = getattr(
                 entry,
                 "command",
                 str(entry),
             )
 
-            lines.append(
-                f"{index:>5}  {command}"
+            exit_code = getattr(
+                entry,
+                "exit_code",
+                None,
             )
 
-        return BuiltinResult(
-            handled=True,
-            stdout=(
-                "\n".join(lines)
-                + ("\n" if lines else "")
-            ),
-        )
+            if exit_code is None:
+                lines.append(
+                    f"{index:>4}  {command}"
+                )
+
+            else:
+                lines.append(
+                    f"{index:>4}  "
+                    f"{command} "
+                    f"[exit={exit_code}]"
+                )
+
+        output = "\n".join(lines)
+
+        if output:
+            output += "\n"
+
+        return _result(output)
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"history: {exc}\n",
-            return_code=1,
+        return _error(
+            "history",
+            str(exc),
         )
 
 
 # ============================================================================
-# MAPLE CONTROL
+# SIMPLE SHELL COMMANDS
 # ============================================================================
 
-def builtin_load_maple(args: list[str], **kwargs) -> BuiltinResult:
-    session = _get_session(kwargs)
+def builtin_echo(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-    if session is None:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="load maple: no active terminal session\n",
-            return_code=1,
-        )
-
-    try:
-        session.load_maple()
-
-        return BuiltinResult(
-            handled=True,
-            stdout="Maple activated for this terminal session.\n",
-        )
-
-    except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"load maple: {exc}\n",
-            return_code=1,
-        )
+    return _result(
+        " ".join(args) + "\n"
+    )
 
 
-def builtin_kill_maple(args: list[str], **kwargs) -> BuiltinResult:
-    session = _get_session(kwargs)
+def builtin_clear(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-    if session is None:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr="kill maple: no active terminal session\n",
-            return_code=1,
-        )
+    # ANSI clear-screen sequence.
+    return _result(
+        "\033[2J\033[H"
+    )
 
-    try:
-        session.kill_maple()
 
-        return BuiltinResult(
-            handled=True,
-            stdout="Maple deactivated for this terminal session.\n",
-        )
+def builtin_exit(
+    args: list[str],
+    **kwargs,
+) -> BuiltinResult:
 
-    except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"kill maple: {exc}\n",
-            return_code=1,
-        )
+    return _result(
+        "",
+        return_code=0,
+    )
 
 
 # ============================================================================
-# BUILTIN REGISTRY
+# COMMAND REGISTRY
 # ============================================================================
 
-BUILTINS: dict[str, Builtin] = {
-    "help": Builtin(
+BUILTINS: dict[str, Builtin] = {}
+
+
+def register_builtin(
+    name: str,
+    handler: Callable,
+    description: str,
+) -> None:
+
+    BUILTINS[name] = Builtin(
+        name=name,
+        handler=handler,
+        description=description,
+    )
+
+
+def _register_defaults() -> None:
+
+    register_builtin(
         "help",
         builtin_help,
         "Show Convexity commands",
-    ),
+    )
 
-    "pwd": Builtin(
+    register_builtin(
         "pwd",
         builtin_pwd,
         "Show current directory",
-    ),
+    )
 
-    "cd": Builtin(
+    register_builtin(
         "cd",
         builtin_cd,
-        "Change directory",
-    ),
+        "Change session directory",
+    )
 
-    "ls": Builtin(
+    register_builtin(
         "ls",
         builtin_ls,
         "List directory",
-    ),
+    )
 
-    "dir": Builtin(
-        "dir",
-        builtin_ls,
-        "List directory",
-    ),
-
-    "cat": Builtin(
+    register_builtin(
         "cat",
         builtin_cat,
         "Read file",
-    ),
+    )
 
-    "read": Builtin(
+    register_builtin(
         "read",
-        builtin_cat,
+        builtin_read,
         "Read file",
-    ),
+    )
 
-    "touch": Builtin(
+    register_builtin(
         "touch",
         builtin_touch,
         "Create file",
-    ),
+    )
 
-    "mkdir": Builtin(
+    register_builtin(
         "mkdir",
         builtin_mkdir,
         "Create directory",
-    ),
+    )
 
-    "write": Builtin(
+    register_builtin(
         "write",
         builtin_write,
         "Write file",
-    ),
+    )
 
-    "append": Builtin(
+    register_builtin(
         "append",
         builtin_append,
         "Append to file",
-    ),
+    )
 
-    "rm": Builtin(
+    register_builtin(
         "rm",
         builtin_rm,
-        "Delete file/directory",
-    ),
+        "Delete file or directory",
+    )
 
-    "del": Builtin(
+    register_builtin(
         "del",
-        builtin_rm,
-        "Delete file/directory",
-    ),
+        builtin_del,
+        "Delete file or directory",
+    )
 
-    "cp": Builtin(
+    register_builtin(
         "cp",
         builtin_cp,
-        "Copy file/directory",
-    ),
+        "Copy file or directory",
+    )
 
-    "copy": Builtin(
+    register_builtin(
         "copy",
-        builtin_cp,
-        "Copy file/directory",
-    ),
+        builtin_copy,
+        "Copy file or directory",
+    )
 
-    "mv": Builtin(
+    register_builtin(
         "mv",
         builtin_mv,
-        "Move file/directory",
-    ),
+        "Move file or directory",
+    )
 
-    "move": Builtin(
+    register_builtin(
         "move",
-        builtin_mv,
-        "Move file/directory",
-    ),
+        builtin_move,
+        "Move file or directory",
+    )
 
-    "find": Builtin(
+    register_builtin(
         "find",
         builtin_find,
         "Search files",
-    ),
+    )
 
-    "grep": Builtin(
+    register_builtin(
         "grep",
         builtin_grep,
         "Search file contents",
-    ),
+    )
 
-    "set": Builtin(
+    register_builtin(
+        "stat",
+        builtin_stat,
+        "Show filesystem information",
+    )
+
+    register_builtin(
+        "exists",
+        builtin_exists,
+        "Check path existence",
+    )
+
+    register_builtin(
         "set",
         builtin_set,
-        "Set/list variables",
-    ),
+        "Set or list session variables",
+    )
 
-    "unset": Builtin(
+    register_builtin(
         "unset",
         builtin_unset,
-        "Remove variable",
-    ),
+        "Remove session variable",
+    )
 
-    "env": Builtin(
+    register_builtin(
         "env",
         builtin_env,
-        "Show environment",
-    ),
+        "Show session environment",
+    )
 
-    "alias": Builtin(
+    register_builtin(
         "alias",
         builtin_alias,
-        "Create/list aliases",
-    ),
+        "Create or list aliases",
+    )
 
-    "unalias": Builtin(
+    register_builtin(
         "unalias",
         builtin_unalias,
         "Remove alias",
-    ),
+    )
 
-    "jobs": Builtin(
+    register_builtin(
         "jobs",
         builtin_jobs,
-        "Show background jobs",
-    ),
+        "Show active processes",
+    )
 
-    "ps": Builtin(
+    register_builtin(
         "ps",
         builtin_ps,
-        "Show processes",
-    ),
+        "Show managed processes",
+    )
 
-    "kill": Builtin(
+    register_builtin(
         "kill",
         builtin_kill,
-        "Terminate process",
-    ),
+        "Terminate managed process",
+    )
 
-    "whoami": Builtin(
+    register_builtin(
         "whoami",
         builtin_whoami,
         "Show current user",
-    ),
+    )
 
-    "hostname": Builtin(
+    register_builtin(
         "hostname",
         builtin_hostname,
-        "Show computer name",
-    ),
+        "Show computer hostname",
+    )
 
-    "sysinfo": Builtin(
+    register_builtin(
         "sysinfo",
         builtin_sysinfo,
         "Show system information",
-    ),
+    )
 
-    "history": Builtin(
+    register_builtin(
         "history",
         builtin_history,
         "Show command history",
-    ),
+    )
 
-    "echo": Builtin(
+    register_builtin(
         "echo",
         builtin_echo,
         "Print text",
-    ),
+    )
 
-    "clear": Builtin(
+    register_builtin(
         "clear",
         builtin_clear,
         "Clear terminal",
-    ),
+    )
 
-    "load": Builtin(
-        "load",
-        builtin_load_maple,
-        "Activate Maple",
-    ),
+    register_builtin(
+        "exit",
+        builtin_exit,
+        "Exit Convexity",
+    )
 
-    "killmaple": Builtin(
-        "killmaple",
-        builtin_kill_maple,
-        "Deactivate Maple",
-    ),
-}
+
+_register_defaults()
 
 
 # ============================================================================
 # DISPATCH
 # ============================================================================
 
+def get_builtin(
+    command: str,
+) -> Optional[Builtin]:
+
+    return BUILTINS.get(
+        command
+    )
+
+
+def is_builtin(
+    command: str,
+) -> bool:
+
+    return command in BUILTINS
+
+
+def list_builtins() -> list[Builtin]:
+
+    return sorted(
+        BUILTINS.values(),
+        key=lambda item: item.name,
+    )
+
+
 def execute_builtin(
-    name: str,
-    args: list[str],
+    command: str,
+    args: Optional[list[str]] = None,
+    *,
+    session: Optional[TerminalSession] = None,
+    source: str = "human",
+    confirmed: bool = False,
     **kwargs,
 ) -> BuiltinResult:
 
-    builtin = BUILTINS.get(
-        name.lower()
+    builtin = get_builtin(
+        command
     )
 
     if builtin is None:
@@ -1377,28 +1948,92 @@ def execute_builtin(
             handled=False
         )
 
+    if args is None:
+        args = []
+
+    call_kwargs = dict(kwargs)
+
+    call_kwargs.update(
+        {
+            "session": session,
+            "source": source,
+            "confirmed": confirmed,
+        }
+    )
+
     try:
+
         return builtin.handler(
             args,
-            **kwargs,
+            **call_kwargs,
         )
 
     except Exception as exc:
-        return BuiltinResult(
-            handled=True,
-            success=False,
-            stderr=f"{name}: {exc}\n",
-            return_code=1,
+
+        return _error(
+            command,
+            str(exc),
         )
 
 
-def is_builtin(name: str) -> bool:
-    return name.lower() in BUILTINS
+# ============================================================================
+# ALIASES / COMPATIBILITY
+# ============================================================================
+
+builtin_read = builtin_cat
+builtin_del = builtin_rm
+builtin_copy = builtin_cp
+builtin_move = builtin_mv
 
 
-def get_builtin(name: str) -> Optional[Builtin]:
-    return BUILTINS.get(name.lower())
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
-
-def list_builtins() -> list[Builtin]:
-    return list(BUILTINS.values())
+__all__ = [
+    "BuiltinResult",
+    "Builtin",
+    "BUILTINS",
+    "register_builtin",
+    "get_builtin",
+    "is_builtin",
+    "list_builtins",
+    "execute_builtin",
+    "builtin_help",
+    "builtin_pwd",
+    "builtin_cd",
+    "builtin_ls",
+    "builtin_cat",
+    "builtin_read",
+    "builtin_touch",
+    "builtin_mkdir",
+    "builtin_write",
+    "builtin_append",
+    "builtin_rm",
+    "builtin_del",
+    "builtin_cp",
+    "builtin_copy",
+    "builtin_mv",
+    "builtin_move",
+    "builtin_find",
+    "builtin_grep",
+    "builtin_stat",
+    "builtin_exists",
+    "builtin_set",
+    "builtin_unset",
+    "builtin_env",
+    "builtin_alias",
+    "builtin_unalias",
+    "builtin_jobs",
+    "builtin_ps",
+    "builtin_kill",
+    "builtin_whoami",
+    "builtin_hostname",
+    "builtin_sysinfo",
+    "builtin_load_maple",
+    "builtin_kill_maple",
+    "builtin_history",
+    "builtin_echo",
+    "builtin_clear",
+    "builtin_exit",
+]
