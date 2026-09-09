@@ -1,17 +1,25 @@
 """
 Convexity Security and Permission Layer
-Version 0.2.0
+Version 1.0.0
 
 Responsibilities:
 - Validate filesystem paths
+- Detect potentially dangerous commands
+- Analyze shell syntax
+- Provide Maple permission checks
+- Validate structured Maple actions
+- Filter child-process environments
 - Enforce optional sandbox boundaries
-- Inspect commands before execution
-- Detect dangerous operations
-- Handle shell operators
-- Provide human/Maple permission checks
-- Prevent obvious command-policy bypasses
 
-Security is a policy layer, not a replacement for the terminal engine.
+Important:
+    Convexity does NOT use this module to restrict normal human terminal use.
+
+    Manual terminal commands are allowed normally.
+
+    When Maple is the execution source, dangerous operations require
+    explicit confirmation.
+
+This module never executes commands.
 """
 
 from __future__ import annotations
@@ -20,42 +28,80 @@ import os
 import re
 import shlex
 import shutil
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from .config import config
 
 
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+
 class SecurityError(Exception):
-    """Base exception for Convexity security violations."""
+    """Base exception for Convexity security errors."""
 
 
 class PermissionDenied(SecurityError):
-    """Raised when an operation requires permission or confirmation."""
+    """Raised when an operation requires permission but was not confirmed."""
+
+
+# ============================================================================
+# COMMAND ANALYSIS
+# ============================================================================
 
 
 @dataclass
 class CommandAnalysis:
-    """Result of analyzing a command before execution."""
+    """Result of analyzing a command without executing it."""
 
     command: str
     executable: str
     arguments: List[str]
+
     dangerous: bool = False
     requires_confirmation: bool = False
+
     contains_shell_operator: bool = False
     shell_operator: Optional[str] = None
+
     reason: str = ""
+
+    source: str = "human"
 
     @property
     def allowed(self) -> bool:
-        return not self.dangerous
+        """
+        Whether the command is currently allowed to proceed.
+
+        A dangerous Maple command is not considered allowed until the caller
+        supplies confirmation.
+
+        Human commands are not blocked merely because they are dangerous.
+        """
+
+        if self.source.lower() == "maple":
+            return not self.requires_confirmation
+
+        return True
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # PATH SECURITY
-# ---------------------------------------------------------------------------
+# ============================================================================
+
+
+def _path_within(parent: Path, child: Path) -> bool:
+    """Return True when child is inside parent."""
+
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
 
 def validate_path(
     path: str | Path,
@@ -66,49 +112,59 @@ def validate_path(
     """
     Resolve and validate a filesystem path.
 
-    If sandboxing is enabled, the resulting path must remain inside
-    Convexity's configured sandbox root.
+    Relative paths are resolved against the current process working
+    directory. Session-specific cwd handling belongs to session.py/runtime.py.
+
+    If SANDBOX_ENABLED is enabled, the final path must remain inside the
+    configured sandbox.
     """
 
-    if not path:
-        raise SecurityError("Path cannot be empty.")
+    if path is None:
+        raise SecurityError("Path cannot be None.")
 
     path_obj = Path(path).expanduser()
+
+    if not str(path_obj).strip():
+        raise SecurityError("Path cannot be empty.")
 
     try:
         if path_obj.exists():
             resolved = path_obj.resolve(strict=True)
         else:
             if not allow_missing:
-                raise SecurityError(f"Path does not exist: {path}")
+                raise SecurityError(
+                    f"Path does not exist: {path_obj}"
+                )
 
-            # Resolve the parent when possible so '..' is normalized.
-            parent = path_obj.parent
-
-            if parent.exists():
-                resolved = parent.resolve() / path_obj.name
-            else:
-                resolved = path_obj.resolve(strict=False)
+            # Resolve as much of the path as possible while allowing the
+            # final target to not exist yet.
+            resolved = path_obj.resolve(strict=False)
 
     except OSError as exc:
-        raise SecurityError(f"Unable to resolve path: {path}") from exc
+        raise SecurityError(
+            f"Unable to resolve path: {path_obj}"
+        ) from exc
 
     if len(str(resolved)) > config.MAX_PATH_LENGTH:
-        raise SecurityError("Path exceeds Convexity's maximum path length.")
+        raise SecurityError(
+            "Path exceeds Convexity's maximum path length."
+        )
 
     if must_exist and not resolved.exists():
-        raise SecurityError(f"Path does not exist: {resolved}")
+        raise SecurityError(
+            f"Path does not exist: {resolved}"
+        )
 
     if config.SANDBOX_ENABLED:
-        sandbox_root = Path(config.get_sandbox_root()).resolve()
+        sandbox_root = Path(
+            config.get_sandbox_root()
+        ).expanduser().resolve()
 
-        try:
-            resolved.relative_to(sandbox_root)
-        except ValueError as exc:
+        if not _path_within(sandbox_root, resolved):
             raise SecurityError(
-                f"Access outside the Convexity sandbox is blocked:\n"
+                "Access outside the Convexity sandbox is blocked:\n"
                 f"{resolved}"
-            ) from exc
+            )
 
     return resolved
 
@@ -116,34 +172,47 @@ def validate_path(
 def validate_directory(path: str | Path) -> Path:
     """Validate that a path exists and is a directory."""
 
-    result = validate_path(path, must_exist=True)
+    result = validate_path(
+        path,
+        must_exist=True,
+        allow_missing=False,
+    )
 
     if not result.is_dir():
-        raise SecurityError(f"Not a directory: {result}")
+        raise SecurityError(
+            f"Not a directory: {result}"
+        )
 
     return result
 
 
 def validate_file(path: str | Path) -> Path:
-    """Validate that a path exists and is a file."""
+    """Validate that a path exists and is a regular file."""
 
-    result = validate_path(path, must_exist=True)
+    result = validate_path(
+        path,
+        must_exist=True,
+        allow_missing=False,
+    )
 
     if not result.is_file():
-        raise SecurityError(f"Not a file: {result}")
+        raise SecurityError(
+            f"Not a file: {result}"
+        )
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# COMMAND PARSING
-# ---------------------------------------------------------------------------
+# ============================================================================
+# COMMAND TOKENIZATION
+# ============================================================================
+
 
 def tokenize_command(command: str) -> List[str]:
     """
-    Safely tokenize a command without executing it.
+    Tokenize a command without executing it.
 
-    shlex is used instead of command.split(), allowing quoted paths such as:
+    Supports quoted arguments such as:
 
         cat "my project/file.txt"
     """
@@ -157,17 +226,21 @@ def tokenize_command(command: str) -> List[str]:
         raise SecurityError("Command cannot be empty.")
 
     try:
-        return shlex.split(command, posix=(os.name != "nt"))
+        return shlex.split(
+            command,
+            posix=(os.name != "nt"),
+        )
     except ValueError as exc:
-        raise SecurityError(f"Invalid command syntax: {exc}") from exc
+        raise SecurityError(
+            f"Invalid command syntax: {exc}"
+        ) from exc
 
 
 def find_shell_operator(command: str) -> Optional[str]:
     """
-    Detect common shell operators.
+    Find the first unquoted shell operator.
 
-    This function only identifies operators.
-    It does not execute them.
+    Detection only. Nothing is executed.
     """
 
     operators = (
@@ -178,51 +251,85 @@ def find_shell_operator(command: str) -> Optional[str]:
         ">",
         "<",
         ";",
+        "&",
     )
 
-    quote = None
+    quote: Optional[str] = None
     escaped = False
 
-    for index, char in enumerate(command):
+    index = 0
+
+    while index < len(command):
+        char = command[index]
+
         if escaped:
             escaped = False
+            index += 1
             continue
 
         if char == "\\":
             escaped = True
+            index += 1
             continue
 
         if quote:
             if char == quote:
                 quote = None
+
+            index += 1
             continue
 
         if char in ("'", '"'):
             quote = char
+            index += 1
             continue
 
-        remaining = command[index:]
-
         for operator in operators:
-            if remaining.startswith(operator):
+            if command.startswith(operator, index):
                 return operator
+
+        index += 1
+
+    if quote:
+        raise SecurityError(
+            "Unclosed quote in command."
+        )
 
     return None
 
 
 def split_shell_segments(command: str) -> List[str]:
     """
-    Split a command into shell segments.
+    Split shell syntax into command/operator segments.
 
-    This is intentionally conservative. A future Convexity parser can replace
-    this with a complete shell grammar.
+    Example:
+
+        python app.py && echo done
+
+    becomes:
+
+        ["python app.py", "&&", "echo done"]
+
+    This function only parses text.
     """
 
-    segments = []
-    current = []
-    quote = None
+    segments: List[str] = []
+    current: List[str] = []
+
+    quote: Optional[str] = None
     escaped = False
     index = 0
+
+    operators = (
+        "&&",
+        "||",
+        ">>",
+        "|",
+        ">",
+        "<",
+        ";",
+        "&",
+    )
 
     while index < len(command):
         char = command[index]
@@ -256,7 +363,7 @@ def split_shell_segments(command: str) -> List[str]:
 
         matched = None
 
-        for operator in ("&&", "||", ">>", "|", ">", "<", ";"):
+        for operator in operators:
             if command.startswith(operator, index):
                 matched = operator
                 break
@@ -269,30 +376,36 @@ def split_shell_segments(command: str) -> List[str]:
 
             segments.append(matched)
             current = []
+
             index += len(matched)
             continue
 
         current.append(char)
         index += 1
 
+    if quote:
+        raise SecurityError(
+            "Unclosed quote in command."
+        )
+
     text = "".join(current).strip()
 
     if text:
         segments.append(text)
 
-    if quote:
-        raise SecurityError("Unclosed quote in command.")
-
     return segments
 
 
-# ---------------------------------------------------------------------------
-# EXECUTABLE SECURITY
-# ---------------------------------------------------------------------------
+# ============================================================================
+# EXECUTABLE INFORMATION
+# ============================================================================
+
 
 def resolve_executable(executable: str) -> Optional[str]:
     """
-    Resolve an executable through PATH without executing it.
+    Resolve an executable through PATH.
+
+    This does not execute anything.
     """
 
     if not executable:
@@ -302,49 +415,175 @@ def resolve_executable(executable: str) -> Optional[str]:
 
 
 def executable_name(command: str) -> str:
-    """Return the executable portion of a command."""
+    """Return the normalized executable name."""
 
     tokens = tokenize_command(command)
 
     if not tokens:
-        raise SecurityError("No executable found.")
+        raise SecurityError(
+            "No executable found."
+        )
 
     executable = Path(tokens[0]).name.lower()
 
-    # Windows executable suffixes.
-    for suffix in (".exe", ".cmd", ".bat", ".com", ".ps1"):
+    for suffix in (
+        ".exe",
+        ".cmd",
+        ".bat",
+        ".com",
+        ".ps1",
+    ):
         if executable.endswith(suffix):
-            executable = executable[: -len(suffix)]
+            executable = executable[:-len(suffix)]
             break
 
     return executable
 
 
-# ---------------------------------------------------------------------------
-# DANGEROUS COMMAND DETECTION
-# ---------------------------------------------------------------------------
+# ============================================================================
+# DANGER DETECTION
+# ============================================================================
 
-def contains_dangerous_pattern(command: str) -> Optional[str]:
+
+def contains_dangerous_pattern(
+    command: str,
+) -> Optional[str]:
     """
-    Search for dangerous command patterns configured in config.py.
+    Check configured dangerous patterns.
+
+    Returns the matching pattern or None.
     """
 
     lowered = command.lower()
 
     for pattern in config.DANGEROUS_PATTERNS:
-        if pattern.lower() in lowered:
-            return pattern
+        if str(pattern).lower() in lowered:
+            return str(pattern)
 
     return None
 
 
-def is_dangerous_command(command: str) -> Tuple[bool, str]:
+def _dangerous_executable(executable: str) -> Optional[str]:
+    """Check whether an executable is configured as dangerous."""
+
+    dangerous_commands = {
+        str(item).lower()
+        for item in config.DANGEROUS_COMMANDS
+    }
+
+    if executable in dangerous_commands:
+        return executable
+
+    return None
+
+
+def _dangerous_arguments(
+    executable: str,
+    arguments: List[str],
+) -> Optional[str]:
     """
-    Determine whether a command appears dangerous.
+    Detect destructive argument combinations.
+
+    This intentionally favors false positives over silently missing obvious
+    destructive patterns when Maple is making the decision.
+    """
+
+    lowered_args = [
+        str(argument).lower()
+        for argument in arguments
+    ]
+
+    joined = " ".join(
+        [executable] + lowered_args
+    )
+
+    checks = [
+        (
+            executable == "rm"
+            and any(arg in {"-r", "-rf", "-fr", "-rfi"}
+                    or arg.startswith("-rf")
+                    for arg in lowered_args),
+            "recursive rm",
+        ),
+        (
+            executable in {"rmdir", "rd"}
+            and any(
+                arg in {"/s", "/q"}
+                for arg in lowered_args
+            ),
+            "recursive directory deletion",
+        ),
+        (
+            executable in {"del", "erase"}
+            and any(
+                arg in {"/s", "/q"}
+                for arg in lowered_args
+            ),
+            "recursive/quiet deletion",
+        ),
+        (
+            executable in {
+                "format",
+                "mkfs",
+                "fdisk",
+                "diskpart",
+            },
+            f"disk/filesystem operation: {executable}",
+        ),
+        (
+            executable in {
+                "shutdown",
+                "reboot",
+                "poweroff",
+            },
+            f"system power operation: {executable}",
+        ),
+        (
+            executable in {
+                "chmod",
+                "chown",
+            },
+            f"permission operation: {executable}",
+        ),
+        (
+            executable in {
+                "mount",
+                "umount",
+            },
+            f"mount operation: {executable}",
+        ),
+    ]
+
+    for matched, reason in checks:
+        if matched:
+            return reason
+
+    # Extra destructive combinations.
+    if executable == "dd":
+        return "raw disk/data operation"
+
+    if executable in {"kill", "pkill", "killall", "taskkill"}:
+        return f"process termination: {executable}"
+
+    if ">" in joined and (
+        "/dev/" in joined
+        or "\\\\.\\physicaldrive" in joined
+    ):
+        return "direct device overwrite"
+
+    return None
+
+
+def is_dangerous_command(
+    command: str,
+) -> Tuple[bool, str]:
+    """
+    Determine whether a command appears potentially dangerous.
 
     Returns:
-        (True, reason)
+
         (False, "")
+        (True, reason)
     """
 
     command = command.strip()
@@ -355,7 +594,10 @@ def is_dangerous_command(command: str) -> Tuple[bool, str]:
     pattern = contains_dangerous_pattern(command)
 
     if pattern:
-        return True, f"Dangerous pattern detected: {pattern}"
+        return (
+            True,
+            f"Dangerous pattern detected: {pattern}",
+        )
 
     try:
         tokens = tokenize_command(command)
@@ -367,56 +609,34 @@ def is_dangerous_command(command: str) -> Tuple[bool, str]:
 
     executable = executable_name(command)
 
-    dangerous_commands = {
-        str(item).lower()
-        for item in config.DANGEROUS_COMMANDS
-    }
+    dangerous_executable = _dangerous_executable(
+        executable
+    )
 
-    if executable in dangerous_commands:
-        return True, f"Dangerous command: {executable}"
+    if dangerous_executable:
+        return (
+            True,
+            f"Dangerous command: {dangerous_executable}",
+        )
 
-    # Additional destructive argument checks.
-    lowered = command.lower()
+    reason = _dangerous_arguments(
+        executable,
+        tokens[1:],
+    )
 
-    destructive_combinations = [
-        ("rm", "-rf"),
-        ("rm", "-r"),
-        ("rmdir", "/s"),
-        ("del", "/s"),
-        ("del", "/q"),
-        ("format",),
-        ("mkfs",),
-        ("fdisk",),
-        ("diskpart",),
-        ("shutdown",),
-        ("reboot",),
-        ("poweroff",),
-        ("chmod",),
-        ("chown",),
-        ("mount",),
-        ("umount",),
-    ]
-
-    for combination in destructive_combinations:
-        if len(combination) == 1:
-            if re.search(
-                rf"(^|\s){re.escape(combination[0])}(\s|$)",
-                lowered,
-            ):
-                return True, f"Potentially destructive command: {combination[0]}"
-
-        elif all(part in lowered for part in combination):
-            return True, (
-                "Potentially destructive command combination: "
-                + " ".join(combination)
-            )
+    if reason:
+        return (
+            True,
+            f"Potentially dangerous operation: {reason}",
+        )
 
     return False, ""
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # COMMAND ANALYSIS
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def analyze_command(
     command: str,
@@ -426,7 +646,8 @@ def analyze_command(
     """
     Analyze a command without executing it.
 
-    source:
+    source values commonly include:
+
         human
         maple
         system
@@ -436,22 +657,23 @@ def analyze_command(
 
     executable = executable_name(command)
 
-    dangerous, reason = is_dangerous_command(command)
+    dangerous, reason = is_dangerous_command(
+        command
+    )
 
     operator = find_shell_operator(command)
 
-    requires_confirmation = (
-        dangerous
-        or (
-            source.lower() == "maple"
-            and config.MAPLE_REQUIRE_PERMISSION
-        )
+    normalized_source = (
+        str(source).strip().lower()
+        or "human"
     )
 
-    # Maple should not bypass the security layer simply because shell
-    # commands are enabled.
-    if source.lower() == "maple" and config.MAPLE_REQUIRE_PERMISSION:
-        requires_confirmation = True
+    # Maple is the only source that automatically enters the
+    # confirmation path.
+    requires_confirmation = (
+        normalized_source == "maple"
+        and dangerous
+    )
 
     return CommandAnalysis(
         command=command,
@@ -462,50 +684,62 @@ def analyze_command(
         contains_shell_operator=operator is not None,
         shell_operator=operator,
         reason=reason,
+        source=normalized_source,
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # COMMAND POLICY
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def check_command(
     command: str,
     *,
     source: str = "human",
+    confirmed: bool = False,
 ) -> CommandAnalysis:
     """
-    Validate a command against Convexity's current policy.
+    Analyze a command and apply the appropriate policy.
 
-    Human users can eventually use the full native Convexity shell.
+    IMPORTANT:
 
-    Maple requests are always routed through the permission layer when
-    MAPLE_REQUIRE_PERMISSION is enabled.
+        Human:
+            Dangerous commands are NOT blocked here.
+
+        Maple:
+            Dangerous commands require confirmation.
+
+    Shell parsing itself remains the responsibility of shell.py/executor.py.
     """
 
-    analysis = analyze_command(command, source=source)
+    analysis = analyze_command(
+        command,
+        source=source,
+    )
 
-    # Always block configured dangerous patterns at this layer.
-    if analysis.dangerous:
+    normalized_source = (
+        str(source).strip().lower()
+        or "human"
+    )
+
+    if (
+        normalized_source == "maple"
+        and analysis.dangerous
+        and not confirmed
+    ):
         raise PermissionDenied(
-            analysis.reason or "Command blocked by security policy."
+            analysis.reason
+            or "Maple requires confirmation for this command."
         )
-
-    # Shell operators are handled by the future shell parser.
-    # Do not silently pass them to subprocess as one executable.
-    if analysis.contains_shell_operator:
-        if not config.ALLOW_SHELL_COMMANDS:
-            raise PermissionDenied(
-                f"Shell operator '{analysis.shell_operator}' "
-                "is disabled by configuration."
-            )
 
     return analysis
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # OPERATION PERMISSIONS
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def check_permission(
     operation: str,
@@ -514,48 +748,75 @@ def check_permission(
     confirmed: bool = False,
 ) -> bool:
     """
-    Check whether an operation may proceed.
+    Check permission for a structured operation.
 
     Human operations:
-        Normal terminal operations are allowed unless explicitly dangerous.
+        Allowed normally.
 
     Maple operations:
-        Require an explicit permission decision when configured.
+        Dangerous operations require confirmation.
+
+    This function does not execute anything.
     """
 
-    operation = operation.lower().strip()
-    source = source.lower().strip()
+    operation = (
+        str(operation)
+        .strip()
+        .lower()
+    )
+
+    source = (
+        str(source)
+        .strip()
+        .lower()
+    )
+
+    if not operation:
+        raise SecurityError(
+            "Operation cannot be empty."
+        )
 
     dangerous_operations = {
         "delete",
+        "remove",
+        "rm",
         "overwrite",
-        "execute_dangerous",
+        "replace",
         "format",
         "partition",
+        "disk",
+        "raw_disk",
         "shutdown",
         "reboot",
+        "poweroff",
+        "kill",
+        "terminate",
         "admin",
+        "privilege",
         "permission_change",
+        "system_config",
     }
 
-    if operation in dangerous_operations:
-        if not confirmed:
+    is_dangerous = (
+        operation in dangerous_operations
+    )
+
+    if source == "maple":
+        if is_dangerous and not confirmed:
             raise PermissionDenied(
-                f"Operation '{operation}' requires confirmation."
+                f"Maple requires confirmation for "
+                f"operation '{operation}'."
             )
 
-    if source == "maple" and config.MAPLE_REQUIRE_PERMISSION:
-        if not confirmed:
-            raise PermissionDenied(
-                f"Maple requires permission for operation '{operation}'."
-            )
-
+    # Human execution is intentionally not blocked by
+    # Maple's confirmation policy.
     return True
 
 
-# ---------------------------------------------------------------------------
-# FILE OPERATION PERMISSIONS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FILE OPERATION SECURITY
+# ============================================================================
+
 
 def check_file_operation(
     operation: str,
@@ -565,21 +826,41 @@ def check_file_operation(
     confirmed: bool = False,
 ) -> Path:
     """
-    Validate a filesystem operation before it reaches filesystem.py.
+    Validate a filesystem operation before execution.
+
+    Path validation is always performed.
+
+    Dangerous-operation confirmation applies to Maple.
     """
 
-    validated = validate_path(path, allow_missing=True)
+    operation = (
+        str(operation)
+        .strip()
+        .lower()
+    )
 
-    operation = operation.lower().strip()
+    validated = validate_path(
+        path,
+        allow_missing=True,
+    )
 
-    if operation in {"delete", "remove", "rm"}:
+    if operation in {
+        "delete",
+        "remove",
+        "rm",
+        "rmdir",
+    }:
         check_permission(
             "delete",
             source=source,
             confirmed=confirmed,
         )
 
-    elif operation in {"write", "overwrite", "replace"}:
+    elif operation in {
+        "write",
+        "overwrite",
+        "replace",
+    }:
         if validated.exists():
             check_permission(
                 "overwrite",
@@ -587,46 +868,63 @@ def check_file_operation(
                 confirmed=confirmed,
             )
 
+    elif operation in {
+        "format",
+        "partition",
+        "raw_disk",
+    }:
+        check_permission(
+            operation,
+            source=source,
+            confirmed=confirmed,
+        )
+
     return validated
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # ENVIRONMENT SECURITY
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def filter_environment(
     environment: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """
-    Create a controlled environment for child processes.
+    Return a controlled child-process environment.
 
-    Only explicitly approved variables are copied from the host environment.
-    This prevents accidental exposure of arbitrary secrets to commands.
+    Only variables explicitly permitted by config.py are copied.
+
+    PATH is preserved because external executables need it.
     """
 
-    source = environment if environment is not None else os.environ
+    source = (
+        environment
+        if environment is not None
+        else os.environ
+    )
 
     allowed_names = {
-        name.upper()
+        str(name).upper()
         for name in config.ALLOWED_ENVIRONMENT_VARIABLES
     }
 
     filtered: dict[str, str] = {}
 
     for key, value in source.items():
-        if key.upper() in allowed_names:
-            filtered[key] = value
+        if str(key).upper() in allowed_names:
+            filtered[str(key)] = str(value)
 
-    # Preserve the essential executable search path.
     if "PATH" in source:
-        filtered["PATH"] = source["PATH"]
+        filtered["PATH"] = str(source["PATH"])
 
     return filtered
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # MAPLE ACTION VALIDATION
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def validate_maple_action(
     action: dict,
@@ -634,67 +932,98 @@ def validate_maple_action(
     confirmed: bool = False,
 ) -> dict:
     """
-    Validate a structured action generated by Maple.
+    Validate a structured action produced by Maple.
 
     Example:
 
         {
             "type": "command",
-            "command": "python script.py"
+            "command": "python app.py"
         }
 
-    Future action types can include:
+    Supported conceptual action types include:
 
+        command
         filesystem
         process
         package
-        network
         git
         shell
+
+    This function validates/authorizes the action.
+    It never executes it.
     """
 
     if not isinstance(action, dict):
-        raise SecurityError("Maple action must be an object/dictionary.")
+        raise SecurityError(
+            "Maple action must be a dictionary."
+        )
 
-    action_type = str(action.get("type", "")).strip().lower()
+    action_type = str(
+        action.get("type", "")
+    ).strip().lower()
 
     if not action_type:
-        raise SecurityError("Maple action has no type.")
+        raise SecurityError(
+            "Maple action has no type."
+        )
+
+    # ------------------------------------------------------------------
+    # COMMAND
+    # ------------------------------------------------------------------
 
     if action_type == "command":
         command = action.get("command")
 
-        if not isinstance(command, str) or not command.strip():
-            raise SecurityError("Maple command action has no command.")
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+        ):
+            raise SecurityError(
+                "Maple command action requires a command string."
+            )
 
-        analysis = check_command(
+        analysis = analyze_command(
             command,
             source="maple",
         )
 
-        check_permission(
-            "execute",
-            source="maple",
-            confirmed=confirmed,
-        )
+        if (
+            analysis.dangerous
+            and not confirmed
+        ):
+            raise PermissionDenied(
+                analysis.reason
+                or "Maple command requires confirmation."
+            )
 
         return {
-            "allowed": True,
+            **action,
             "type": "command",
-            "command": command,
-            "executable": analysis.executable,
-            "arguments": analysis.arguments,
+            "analysis": analysis,
+            "confirmed": confirmed,
         }
 
+    # ------------------------------------------------------------------
+    # FILESYSTEM
+    # ------------------------------------------------------------------
+
     if action_type == "filesystem":
-        operation = str(action.get("operation", "")).strip()
+        operation = str(
+            action.get("operation", "")
+        ).strip().lower()
+
         path = action.get("path")
 
         if not operation:
-            raise SecurityError("Filesystem action has no operation.")
+            raise SecurityError(
+                "Filesystem action has no operation."
+            )
 
-        if not path:
-            raise SecurityError("Filesystem action has no path.")
+        if path is None:
+            raise SecurityError(
+                "Filesystem action has no path."
+            )
 
         validated = check_file_operation(
             operation,
@@ -704,39 +1033,203 @@ def validate_maple_action(
         )
 
         return {
-            "allowed": True,
+            **action,
             "type": "filesystem",
-            "operation": operation,
             "path": str(validated),
+            "confirmed": confirmed,
         }
+
+    # ------------------------------------------------------------------
+    # PROCESS
+    # ------------------------------------------------------------------
+
+    if action_type == "process":
+        operation = str(
+            action.get("operation", "")
+        ).strip().lower()
+
+        if not operation:
+            raise SecurityError(
+                "Process action has no operation."
+            )
+
+        check_permission(
+            operation,
+            source="maple",
+            confirmed=confirmed,
+        )
+
+        return {
+            **action,
+            "type": "process",
+            "confirmed": confirmed,
+        }
+
+    # ------------------------------------------------------------------
+    # PACKAGE
+    # ------------------------------------------------------------------
+
+    if action_type == "package":
+        operation = str(
+            action.get("operation", "install")
+        ).strip().lower()
+
+        # Installing packages can alter the environment, so Maple should
+        # explicitly authorize the operation through its approval system.
+        if operation in {
+            "install",
+            "remove",
+            "upgrade",
+            "uninstall",
+        }:
+            if not confirmed:
+                raise PermissionDenied(
+                    f"Maple requires confirmation for "
+                    f"package operation '{operation}'."
+                )
+
+        return {
+            **action,
+            "type": "package",
+            "confirmed": confirmed,
+        }
+
+    # ------------------------------------------------------------------
+    # GIT
+    # ------------------------------------------------------------------
+
+    if action_type == "git":
+        operation = str(
+            action.get("operation", "")
+        ).strip().lower()
+
+        if operation in {
+            "reset",
+            "clean",
+            "push",
+            "force_push",
+            "delete",
+        } and not confirmed:
+            raise PermissionDenied(
+                f"Maple requires confirmation for "
+                f"git operation '{operation}'."
+            )
+
+        return {
+            **action,
+            "type": "git",
+            "confirmed": confirmed,
+        }
+
+    # ------------------------------------------------------------------
+    # SHELL
+    # ------------------------------------------------------------------
+
+    if action_type == "shell":
+        command = action.get("command")
+
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+        ):
+            raise SecurityError(
+                "Shell action requires a command string."
+            )
+
+        analysis = analyze_command(
+            command,
+            source="maple",
+        )
+
+        if (
+            analysis.dangerous
+            and not confirmed
+        ):
+            raise PermissionDenied(
+                analysis.reason
+                or "Maple shell action requires confirmation."
+            )
+
+        return {
+            **action,
+            "type": "shell",
+            "analysis": analysis,
+            "confirmed": confirmed,
+        }
+
+    # ------------------------------------------------------------------
+    # UNKNOWN ACTION
+    # ------------------------------------------------------------------
 
     raise SecurityError(
         f"Unsupported Maple action type: {action_type}"
     )
 
 
-# ---------------------------------------------------------------------------
-# PUBLIC HELPERS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# CONVENIENCE API
+# ============================================================================
 
-def is_path_safe(path: str | Path) -> bool:
-    """Return True if a path passes Convexity's path policy."""
+
+def requires_confirmation(
+    command: str,
+    *,
+    source: str = "maple",
+) -> bool:
+    """
+    Return whether a command requires confirmation.
+
+    This is intentionally non-throwing.
+    """
 
     try:
-        validate_path(path)
-        return True
+        analysis = analyze_command(
+            command,
+            source=source,
+        )
     except SecurityError:
-        return False
-
-
-def is_command_safe(command: str) -> bool:
-    """Return True if a command passes the current security policy."""
-
-    try:
-        check_command(command)
         return True
-    except SecurityError:
-        return False
+
+    return analysis.requires_confirmation
+
+
+def authorize_command(
+    command: str,
+    *,
+    source: str = "human",
+    confirmed: bool = False,
+) -> CommandAnalysis:
+    """
+    Analyze and authorize a command.
+
+    Human:
+        Returns analysis normally.
+
+    Maple:
+        Raises PermissionDenied for dangerous commands unless confirmed.
+    """
+
+    return check_command(
+        command,
+        source=source,
+        confirmed=confirmed,
+    )
+
+
+def validate_command_syntax(
+    command: str,
+) -> bool:
+    """
+    Validate command syntax without applying execution policy.
+    """
+
+    tokenize_command(command)
+    return True
+
+
+# ============================================================================
+# PUBLIC EXPORTS
+# ============================================================================
 
 
 __all__ = [
@@ -759,6 +1252,7 @@ __all__ = [
     "check_file_operation",
     "filter_environment",
     "validate_maple_action",
-    "is_path_safe",
-    "is_command_safe",
+    "requires_confirmation",
+    "authorize_command",
+    "validate_command_syntax",
 ]
