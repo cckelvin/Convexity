@@ -1,43 +1,47 @@
 """
-Convexity Process & Job Manager
-Version 0.7.0
+Convexity Job Compatibility Layer
+Version: 1.0.0
 
-Provides Convexity-native process/job management.
+Jobs are a user-facing view over Convexity's canonical process layer.
 
-Responsibilities:
-    - register running processes
-    - track PIDs
-    - foreground/background state
-    - process status
-    - terminate
-    - force kill
-    - wait
-    - job IDs
-    - job listing
-    - cleanup finished jobs
+Canonical process management:
+    terminal/process.py
 
-This module does not use Bash, PowerShell, CMD, or Termux.
+This module exists for:
+    jobs
+    ps
+    job lookup
+    job control
+    compatibility with older terminal code
+
+It does NOT create subprocesses directly.
 """
 
 from __future__ import annotations
 
-import os
 import signal
-import subprocess
-import threading
-import time
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import List, Optional
+
+from .process import (
+    ManagedProcess,
+    ProcessInfo,
+    ProcessManager,
+    ProcessState,
+    process_manager,
+)
 
 
-# ---------------------------------------------------------------------------
-# JOB STATES
-# ---------------------------------------------------------------------------
+__version__ = "1.0.0"
+
+
+# ============================================================================
+# JOB STATE
+# ============================================================================
 
 class JobState(str, Enum):
-
     CREATED = "created"
     RUNNING = "running"
     STOPPED = "stopped"
@@ -48,20 +52,32 @@ class JobState(str, Enum):
     UNKNOWN = "unknown"
 
 
-# ---------------------------------------------------------------------------
+def _map_state(state: ProcessState) -> JobState:
+    """
+    Convert canonical ProcessState into the legacy JobState API.
+    """
+
+    try:
+        return JobState(state.value)
+    except ValueError:
+        return JobState.UNKNOWN
+
+
+# ============================================================================
 # JOB
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 @dataclass
 class Job:
+    """
+    Compatibility representation of a managed Convexity process.
+    """
 
     job_id: int
-
     pid: int
-
     command: str
 
-    process: subprocess.Popen
+    process: ManagedProcess
 
     state: JobState = JobState.CREATED
 
@@ -69,9 +85,7 @@ class Job:
 
     background: bool = False
 
-    started_at: float = field(
-        default_factory=time.time
-    )
+    started_at: float = 0.0
 
     finished_at: Optional[float] = None
 
@@ -81,156 +95,178 @@ class Job:
 
     stderr: str = ""
 
-    lock: threading.Lock = field(
-        default_factory=threading.Lock,
-        repr=False,
-    )
-
     @property
     def running(self) -> bool:
-
         return self.process.poll() is None
 
     @property
     def duration(self) -> float:
+        return self.process.duration
 
-        end = (
-            self.finished_at
-            if self.finished_at is not None
-            else time.time()
+    def refresh(self) -> JobState:
+        """
+        Refresh job state from the canonical process.
+        """
+
+        self.process.poll()
+
+        info = self.process.info()
+
+        self.state = _map_state(
+            info.state
         )
 
-        return end - self.started_at
+        self.return_code = (
+            info.return_code
+        )
+
+        self.finished_at = (
+            info.finished_at
+        )
+
+        self.stdout = (
+            self.process.stdout()
+        )
+
+        self.stderr = (
+            self.process.stderr()
+        )
+
+        return self.state
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # JOB MANAGER
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class JobManager:
+    """
+    Compatibility facade around ProcessManager.
 
-    def __init__(self) -> None:
+    No process creation happens here.
+    """
 
-        self._jobs: Dict[int, Job] = {}
-
-        self._next_job_id = 1
-
-        self._lock = threading.RLock()
-
-    # ------------------------------------------------------------------
-    # REGISTER
-    # ------------------------------------------------------------------
-
-    def register(
+    def __init__(
         self,
-        process: subprocess.Popen,
-        command: str,
-        *,
-        background: bool = False,
-        cwd: Optional[str] = None,
+        manager: Optional[ProcessManager] = None,
+    ) -> None:
+
+        self.process_manager = (
+            manager
+            if manager is not None
+            else process_manager
+        )
+
+    # ========================================================================
+    # INTERNAL CONVERSION
+    # ========================================================================
+
+    @staticmethod
+    def _to_job(
+        process: ManagedProcess,
     ) -> Job:
 
-        with self._lock:
+        info = process.info()
 
-            job = Job(
-                job_id=self._next_job_id,
-                pid=process.pid,
-                command=command,
-                process=process,
-                state=JobState.RUNNING,
-                background=background,
-                cwd=cwd,
-            )
+        job = Job(
+            job_id=info.process_id,
+            pid=info.pid,
+            command=info.command,
+            process=process,
+            state=_map_state(
+                info.state
+            ),
+            return_code=info.return_code,
+            background=info.background,
+            started_at=info.started_at,
+            finished_at=info.finished_at,
+            cwd=info.cwd,
+        )
 
-            self._jobs[
-                self._next_job_id
-            ] = job
-
-            self._next_job_id += 1
+        job.stdout = process.stdout()
+        job.stderr = process.stderr()
 
         return job
 
-    # ------------------------------------------------------------------
+    # ========================================================================
     # GET
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def get(
         self,
         job_id: int,
     ) -> Optional[Job]:
 
-        with self._lock:
+        process = self.process_manager.get(
+            job_id
+        )
 
-            return self._jobs.get(
-                job_id
-            )
+        if process is None:
+            return None
+
+        return self._to_job(
+            process
+        )
 
     def get_by_pid(
         self,
         pid: int,
     ) -> Optional[Job]:
 
-        with self._lock:
+        processes = self.process_manager.list(
+            include_finished=True
+        )
 
-            for job in self._jobs.values():
+        for process in processes:
 
-                if job.pid == pid:
-                    return job
+            info = process.info()
+
+            if info.pid == pid:
+
+                return self._to_job(
+                    process
+                )
 
         return None
 
-    # ------------------------------------------------------------------
-    # STATUS
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # REGISTER
+    # ========================================================================
+
+    def register(
+        self,
+        process,
+        command: str,
+        *,
+        background: bool = False,
+        cwd: Optional[str] = None,
+    ) -> Job:
+        """
+        Compatibility method.
+
+        New code should create processes through ProcessManager.
+        """
+
+        raise RuntimeError(
+            "JobManager.register() no longer accepts raw "
+            "subprocess objects. Create the process through "
+            "terminal.process.ProcessManager instead."
+        )
+
+    # ========================================================================
+    # UPDATE
+    # ========================================================================
 
     def update(
         self,
         job: Job,
     ) -> JobState:
 
-        return_code = job.process.poll()
+        return job.refresh()
 
-        with job.lock:
-
-            if return_code is None:
-
-                if job.state not in {
-                    JobState.STOPPED,
-                    JobState.TERMINATED,
-                    JobState.KILLED,
-                }:
-
-                    job.state = JobState.RUNNING
-
-                return job.state
-
-            job.return_code = return_code
-
-            if job.finished_at is None:
-
-                job.finished_at = time.time()
-
-            if job.state == JobState.TERMINATED:
-
-                return job.state
-
-            if job.state == JobState.KILLED:
-
-                return job.state
-
-            if return_code == 0:
-
-                job.state = JobState.COMPLETED
-
-            else:
-
-                job.state = JobState.FAILED
-
-            return job.state
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # LIST
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def list_jobs(
         self,
@@ -238,32 +274,28 @@ class JobManager:
         include_finished: bool = True,
     ) -> List[Job]:
 
-        with self._lock:
+        processes = self.process_manager.list(
+            include_finished=include_finished
+        )
 
-            jobs = list(
-                self._jobs.values()
+        jobs = []
+
+        for process in processes:
+
+            jobs.append(
+                self._to_job(
+                    process
+                )
             )
-
-        for job in jobs:
-
-            self.update(job)
-
-        if not include_finished:
-
-            jobs = [
-                job
-                for job in jobs
-                if job.running
-            ]
 
         return sorted(
             jobs,
             key=lambda item: item.job_id,
         )
 
-    # ------------------------------------------------------------------
-    # START MONITOR
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # MONITOR
+    # ========================================================================
 
     def monitor(
         self,
@@ -271,25 +303,17 @@ class JobManager:
         *,
         interval: float = 0.25,
     ) -> None:
+        """
+        ProcessManager already monitors managed processes.
 
-        def worker() -> None:
+        Kept for compatibility.
+        """
 
-            while job.process.poll() is None:
+        return None
 
-                time.sleep(interval)
-
-            self.update(job)
-
-        thread = threading.Thread(
-            target=worker,
-            daemon=True,
-        )
-
-        thread.start()
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # WAIT
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def wait(
         self,
@@ -297,103 +321,45 @@ class JobManager:
         timeout: Optional[float] = None,
     ) -> Optional[int]:
 
-        job = self.get(job_id)
-
-        if job is None:
-            return None
-
         try:
 
-            code = job.process.wait(
-                timeout=timeout
+            return self.process_manager.wait(
+                job_id,
+                timeout=timeout,
             )
 
-        except subprocess.TimeoutExpired:
-
+        except Exception:
             return None
 
-        self.update(job)
-
-        return code
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # TERMINATE
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def terminate(
         self,
         job_id: int,
     ) -> bool:
 
-        job = self.get(job_id)
+        return self.process_manager.terminate(
+            job_id
+        )
 
-        if job is None:
-            return False
-
-        if not job.running:
-
-            self.update(job)
-
-            return True
-
-        try:
-
-            job.process.terminate()
-
-            with job.lock:
-                job.state = JobState.TERMINATED
-
-            return True
-
-        except OSError:
-
-            return False
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # KILL
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def kill(
         self,
         job_id: int,
     ) -> bool:
 
-        job = self.get(job_id)
+        return self.process_manager.kill(
+            job_id
+        )
 
-        if job is None:
-            return False
-
-        if not job.running:
-
-            self.update(job)
-
-            return True
-
-        try:
-
-            if os.name == "nt":
-
-                job.process.kill()
-
-            else:
-
-                os.kill(
-                    job.pid,
-                    signal.SIGKILL,
-                )
-
-            with job.lock:
-                job.state = JobState.KILLED
-
-            return True
-
-        except OSError:
-
-            return False
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # SIGNAL
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def send_signal(
         self,
@@ -401,219 +367,109 @@ class JobManager:
         signum: int,
     ) -> bool:
 
-        job = self.get(job_id)
+        return self.process_manager.send_signal(
+            job_id,
+            signum,
+        )
 
-        if job is None or not job.running:
-            return False
-
-        try:
-
-            if os.name == "nt":
-
-                # Windows has a different signal model.
-                # CTRL_BREAK_EVENT can be used for console groups,
-                # but requires the process to have been started correctly.
-                if signum == signal.SIGTERM:
-
-                    job.process.terminate()
-
-                else:
-
-                    job.process.send_signal(
-                        signum
-                    )
-
-            else:
-
-                os.kill(
-                    job.pid,
-                    signum,
-                )
-
-            return True
-
-        except OSError:
-
-            return False
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # STOP
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def stop(
         self,
         job_id: int,
     ) -> bool:
 
-        job = self.get(job_id)
+        if hasattr(
+            self.process_manager,
+            "send_signal",
+        ):
 
-        if job is None or not job.running:
-            return False
-
-        if os.name == "nt":
-
-            # Windows process suspension requires
-            # platform-specific APIs. Keep state explicit.
-            return False
-
-        try:
-
-            os.kill(
-                job.pid,
+            return self.process_manager.send_signal(
+                job_id,
                 signal.SIGSTOP,
             )
 
-            with job.lock:
-                job.state = JobState.STOPPED
+        return False
 
-            return True
-
-        except OSError:
-
-            return False
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # CONTINUE
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def continue_job(
         self,
         job_id: int,
     ) -> bool:
 
-        job = self.get(job_id)
+        if hasattr(
+            self.process_manager,
+            "send_signal",
+        ):
 
-        if job is None:
-            return False
-
-        if os.name == "nt":
-
-            return False
-
-        try:
-
-            os.kill(
-                job.pid,
+            return self.process_manager.send_signal(
+                job_id,
                 signal.SIGCONT,
             )
 
-            with job.lock:
-                job.state = JobState.RUNNING
+        return False
 
-            return True
-
-        except OSError:
-
-            return False
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # REMOVE
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def remove(
         self,
         job_id: int,
     ) -> bool:
 
-        with self._lock:
+        process = self.process_manager.get(
+            job_id
+        )
 
-            if job_id not in self._jobs:
-                return False
+        if process is None:
+            return False
 
-            job = self._jobs[job_id]
+        if process.poll() is None:
+            return False
 
-            if job.running:
-                return False
+        try:
 
-            del self._jobs[job_id]
-
-            return True
-
-    # ------------------------------------------------------------------
-    # CLEANUP
-    # ------------------------------------------------------------------
-
-    def cleanup_finished(
-        self,
-    ) -> int:
-
-        removed = 0
-
-        with self._lock:
-
-            job_ids = list(
-                self._jobs.keys()
+            return self.process_manager.remove(
+                job_id
             )
 
-        for job_id in job_ids:
+        except AttributeError:
 
-            job = self.get(job_id)
+            return False
 
-            if job is None:
-                continue
+    # ========================================================================
+    # CLEANUP
+    # ========================================================================
 
-            self.update(job)
+    def cleanup_finished(self) -> int:
 
-            if not job.running:
+        return self.process_manager.remove_finished()
 
-                if self.remove(job_id):
-
-                    removed += 1
-
-        return removed
-
-    # ------------------------------------------------------------------
+    # ========================================================================
     # TERMINATE ALL
-    # ------------------------------------------------------------------
+    # ========================================================================
 
     def terminate_all(self) -> int:
 
-        jobs = self.list_jobs(
-            include_finished=False
-        )
-
-        count = 0
-
-        for job in jobs:
-
-            if self.terminate(
-                job.job_id
-            ):
-                count += 1
-
-        return count
+        return self.process_manager.terminate_all()
 
 
-# ---------------------------------------------------------------------------
-# GLOBAL MANAGER
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GLOBAL JOB MANAGER
+# ============================================================================
 
 job_manager = JobManager()
 
 
-# ---------------------------------------------------------------------------
-# CONVENIENCE FUNCTIONS
-# ---------------------------------------------------------------------------
-
-def register_job(
-    process: subprocess.Popen,
-    command: str,
-    *,
-    background: bool = False,
-    cwd: Optional[str] = None,
-) -> Job:
-
-    job = job_manager.register(
-        process,
-        command,
-        background=background,
-        cwd=cwd,
-    )
-
-    job_manager.monitor(job)
-
-    return job
-
+# ============================================================================
+# CONVENIENCE API
+# ============================================================================
 
 def get_job(
     job_id: int,
@@ -650,7 +506,7 @@ def wait_job(
 
     return job_manager.wait(
         job_id,
-        timeout,
+        timeout
     )
 
 
@@ -700,7 +556,6 @@ __all__ = [
     "Job",
     "JobManager",
     "job_manager",
-    "register_job",
     "get_job",
     "get_job_by_pid",
     "list_jobs",
