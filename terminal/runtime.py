@@ -1,247 +1,216 @@
 """
 Convexity Terminal Runtime
-Version: 1.0.0
+Version: 1.0.1
 
-Coordinates the low-level terminal subsystems.
-
-This module is intentionally NOT:
-- an AI system
-- a model loader
-- a memory system
-- a chat system
-- a Maple reasoning engine
-
-Those belong in their respective top-level systems.
+Central coordinator for Convexity terminal subsystems.
 
 Responsibilities:
-- Create/manage terminal sessions.
-- Build execution contexts.
-- Pass session cwd/environment to processes.
-- Track runtime state.
-- Provide a clean integration layer between terminal.py,
-  process.py, executor.py, shell.py and session.py.
+- Manage terminal sessions
+- Build execution contexts
+- Connect sessions to the command executor
+- Execute foreground commands
+- Start background commands
+- Track runtime statistics
+- Record command history
+
+This module intentionally does NOT contain:
+- AI/model logic
+- Maple reasoning
+- Memory systems
+- Chat logic
+- Model loading
+- Provider logic
+
+Those belong to maple/ and model/.
 """
 
 from __future__ import annotations
 
 import time
-
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 from .session import (
     TerminalSession,
     SessionManager,
     get_session_manager,
 )
-
-try:
-    from .executor import (
-        CommandExecutor,
-        ExecutionResult,
-    )
-except ImportError:
-    CommandExecutor = None
-    ExecutionResult = Any
+from .executor import CommandExecutor
 
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 
 class RuntimeErrorBase(Exception):
-    """Base Convexity runtime error."""
+    """Base exception for Convexity runtime errors."""
 
 
 class RuntimeClosedError(RuntimeErrorBase):
-    """Raised when the runtime is closed."""
+    """Raised when an operation is attempted on a closed runtime."""
 
 
 class RuntimeExecutionError(RuntimeErrorBase):
-    """Raised when runtime execution cannot be performed."""
+    """Raised when runtime execution fails unexpectedly."""
 
 
-# ---------------------------------------------------------------------------
-# Execution context
-# ---------------------------------------------------------------------------
+# ============================================================
+# EXECUTION CONTEXT
+# ============================================================
 
 @dataclass
 class ExecutionContext:
     """
-    Immutable-ish snapshot of the environment required to execute
-    a command for a particular session.
-
-    This prevents process execution from depending on global cwd
-    or global environment state.
+    Snapshot of the environment in which a command executes.
     """
 
     session_id: str
-
     cwd: str
-
     environment: dict[str, str]
-
     columns: int
-
     rows: int
-
     created_at: float
 
     def to_dict(self) -> dict[str, Any]:
-
         return {
             "session_id": self.session_id,
             "cwd": self.cwd,
-            "environment": dict(
-                self.environment
-            ),
+            "environment": dict(self.environment),
             "columns": self.columns,
             "rows": self.rows,
             "created_at": self.created_at,
         }
 
 
-# ---------------------------------------------------------------------------
-# Runtime statistics
-# ---------------------------------------------------------------------------
+# ============================================================
+# RUNTIME STATISTICS
+# ============================================================
 
 @dataclass
 class RuntimeStats:
-    """Basic runtime statistics."""
+    """
+    Runtime-level statistics.
+    """
 
     started_at: float
-
     commands_executed: int = 0
-
     successful_commands: int = 0
-
     failed_commands: int = 0
-
     background_commands: int = 0
-
     active_sessions: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        uptime = max(0.0, time.time() - self.started_at)
 
         return {
             "started_at": self.started_at,
-            "uptime": max(
-                0.0,
-                time.time() - self.started_at,
-            ),
-            "commands_executed": (
-                self.commands_executed
-            ),
-            "successful_commands": (
-                self.successful_commands
-            ),
-            "failed_commands": (
-                self.failed_commands
-            ),
-            "background_commands": (
-                self.background_commands
-            ),
-            "active_sessions": (
-                self.active_sessions
-            ),
+            "uptime": uptime,
+            "commands_executed": self.commands_executed,
+            "successful_commands": self.successful_commands,
+            "failed_commands": self.failed_commands,
+            "background_commands": self.background_commands,
+            "active_sessions": self.active_sessions,
         }
 
 
-# ---------------------------------------------------------------------------
-# Terminal Runtime
-# ---------------------------------------------------------------------------
+# ============================================================
+# TERMINAL RUNTIME
+# ============================================================
 
 class TerminalRuntime:
     """
-    Central runtime coordinator for Convexity's terminal subsystem.
+    Central runtime coordinator for Convexity Terminal.
 
-    The runtime owns sessions and connects them to the command
-    execution layer.
+    The runtime connects:
 
-    It deliberately does not implement:
-    - AI
-    - model inference
-    - memory
-    - conversations
-    - Maple reasoning
+        Session
+            ↓
+        Execution Context
+            ↓
+        Command Executor
+            ↓
+        Operating System
     """
 
     def __init__(
         self,
         *,
-        session_manager: Optional[
-            SessionManager
-        ] = None,
-        executor: Optional[
-            CommandExecutor
-        ] = None,
-    ):
+        session_manager: Optional[SessionManager] = None,
+        executor: Optional[CommandExecutor] = None,
+    ) -> None:
 
         self.session_manager = (
             session_manager
-            or get_session_manager()
+            if session_manager is not None
+            else get_session_manager()
         )
 
-        self.executor = executor
+        self.executor = (
+            executor
+            if executor is not None
+            else CommandExecutor()
+        )
 
         self.started_at = time.time()
-
         self.closed = False
 
         self.stats = RuntimeStats(
-            started_at=self.started_at
+            started_at=self.started_at,
+            active_sessions=0,
         )
 
-    # -----------------------------------------------------------------------
-    # Lifecycle
-    # -----------------------------------------------------------------------
+    # ========================================================
+    # LIFECYCLE
+    # ========================================================
 
     def _ensure_open(self) -> None:
-
         if self.closed:
             raise RuntimeClosedError(
-                "Convexity terminal runtime is closed."
+                "Convexity Terminal Runtime is closed."
             )
 
     def close(self) -> None:
+        """
+        Close the runtime and all managed sessions.
+        """
 
         if self.closed:
             return
 
-        self.session_manager.close_all()
+        try:
+            self.session_manager.close_all()
+        finally:
+            self.closed = True
+            self.stats.active_sessions = 0
 
-        self.closed = True
-
-        self.stats.active_sessions = 0
-
-    # -----------------------------------------------------------------------
-    # Sessions
-    # -----------------------------------------------------------------------
+    # ========================================================
+    # SESSION MANAGEMENT
+    # ========================================================
 
     def create_session(
         self,
         *,
-        cwd: Optional[str] = None,
-        env: Optional[dict[str, str]] = None,
-        columns: int = 120,
-        rows: int = 30,
-        history_limit: int = 1000,
+        session_id: Optional[str] = None,
     ) -> TerminalSession:
+        """
+        Create a new independent terminal session.
+        """
 
         self._ensure_open()
 
-        session = self.session_manager.create(
-            cwd=cwd,
-            env=env,
-            columns=columns,
-            rows=rows,
-            history_limit=history_limit,
-        )
+        if session_id:
+            session = self.session_manager.create_session(
+                session_id=session_id
+            )
+        else:
+            session = self.session_manager.create_session()
 
-        self._update_session_stats()
+        self.stats.active_sessions = len(
+            self.session_manager.list_sessions()
+        )
 
         return session
 
@@ -249,378 +218,369 @@ class TerminalRuntime:
         self,
         session_id: str,
     ) -> TerminalSession:
+        """
+        Retrieve a terminal session.
+        """
 
         self._ensure_open()
 
-        return self.session_manager.get(
-            session_id
-        )
+        session = self.session_manager.get_session(session_id)
+
+        if session is None:
+            raise RuntimeExecutionError(
+                f"Session not found: {session_id}"
+            )
+
+        return session
 
     def remove_session(
         self,
         session_id: str,
     ) -> bool:
+        """
+        Remove a terminal session.
+        """
 
         self._ensure_open()
 
-        result = self.session_manager.remove(
+        removed = self.session_manager.remove_session(
             session_id
         )
 
-        self._update_session_stats()
-
-        return result
-
-    def list_sessions(
-        self,
-    ) -> list[TerminalSession]:
-
-        self._ensure_open()
-
-        return self.session_manager.list()
-
-    def _update_session_stats(self) -> None:
-
-        self.stats.active_sessions = (
-            self.session_manager.count()
+        self.stats.active_sessions = len(
+            self.session_manager.list_sessions()
         )
 
-    # -----------------------------------------------------------------------
-    # Context
-    # -----------------------------------------------------------------------
+        return removed
 
-    def create_context(
-        self,
-        session: TerminalSession,
-    ) -> ExecutionContext:
+    def list_sessions(self) -> list[Any]:
+        """
+        Return all active sessions.
+        """
 
         self._ensure_open()
 
-        if session.closed:
-            raise RuntimeExecutionError(
-                "Cannot create context from "
-                "a closed session."
-            )
+        sessions = self.session_manager.list_sessions()
+
+        self.stats.active_sessions = len(sessions)
+
+        return sessions
+
+    # ========================================================
+    # CONTEXT
+    # ========================================================
+
+    def get_context(
+        self,
+        session_id: str,
+    ) -> ExecutionContext:
+        """
+        Build an execution context from a session.
+        """
+
+        self._ensure_open()
+
+        session = self.get_session(session_id)
 
         return ExecutionContext(
             session_id=session.session_id,
             cwd=session.cwd,
-            environment=session.export_environment(),
+            environment=dict(session.environment),
             columns=session.columns,
             rows=session.rows,
             created_at=time.time(),
         )
 
-    def context_for(
-        self,
-        session_id: str,
-    ) -> ExecutionContext:
-
-        session = self.get_session(
-            session_id
-        )
-
-        return self.create_context(
-            session
-        )
-
-    # -----------------------------------------------------------------------
-    # Executor integration
-    # -----------------------------------------------------------------------
-
-    def set_executor(
-        self,
-        executor: CommandExecutor,
-    ) -> None:
-
-        self._ensure_open()
-
-        self.executor = executor
-
-    def _require_executor(self):
-
-        if self.executor is None:
-
-            raise RuntimeExecutionError(
-                "No CommandExecutor is attached "
-                "to the terminal runtime."
-            )
-
-        return self.executor
-
-    # -----------------------------------------------------------------------
-    # Command execution
-    # -----------------------------------------------------------------------
+    # ========================================================
+    # FOREGROUND EXECUTION
+    # ========================================================
 
     def execute(
         self,
-        session: TerminalSession,
-        command: str | Sequence[str],
+        session_id: str,
+        command: str,
         *,
-        timeout: Optional[float] = None,
-        capture_output: bool = True,
-        check: bool = False,
-        source: str = "user",
-        **kwargs,
+        source: str = "human",
+        confirmed: bool = False,
+        timeout: Optional[int] = None,
     ):
         """
-        Execute a command using the session's context.
+        Execute a foreground command.
 
-        The exact execution implementation remains in executor.py.
+        source:
+            human
+            maple
+            system
+            flow
 
-        This method's job is to provide:
-        - session cwd
-        - session environment
-        - history
-        - runtime statistics
+        confirmed:
+            Used when an authorized Maple operation has
+            already received confirmation.
         """
 
         self._ensure_open()
 
-        if session.closed:
-            raise RuntimeExecutionError(
-                "Cannot execute using a closed session."
-            )
+        if not command or not command.strip():
+            raise ValueError("Command cannot be empty.")
 
-        executor = self._require_executor()
-
-        context = self.create_context(
-            session
-        )
+        session = self.get_session(session_id)
+        context = self.get_context(session_id)
 
         started = time.time()
 
-        self.stats.commands_executed += 1
-
         try:
-
-            result = executor.execute(
+            result = self.executor.execute(
                 command,
                 cwd=context.cwd,
-                env=context.environment,
+                environment=context.environment,
+                source=source,
+                confirmed=confirmed,
                 timeout=timeout,
-                capture_output=capture_output,
-                check=check,
-                **kwargs,
             )
 
         except Exception:
-
             self.stats.failed_commands += 1
-
-            duration = (
-                time.time() - started
-            )
-
-            if isinstance(
-                command,
-                str,
-            ):
-                command_text = command
-            else:
-                command_text = " ".join(
-                    str(item)
-                    for item in command
-                )
-
-            session.add_history(
-                command_text,
-                exit_code=None,
-                duration=duration,
-                source=source,
-            )
 
             raise
 
-        duration = (
-            time.time() - started
-        )
+        finally:
+            self.stats.commands_executed += 1
 
-        exit_code = getattr(
-            result,
-            "returncode",
-            None,
-        )
+        duration = time.time() - started
 
-        if exit_code == 0:
-
+        if result.success:
             self.stats.successful_commands += 1
-
         else:
-
             self.stats.failed_commands += 1
 
-        if isinstance(
-            command,
-            str,
-        ):
-            command_text = command
-        else:
-            command_text = " ".join(
-                str(item)
-                for item in command
+        # ----------------------------------------------------
+        # History
+        # ----------------------------------------------------
+
+        try:
+            session.add_history(
+                command=command,
+                output=result.stdout,
+                error=result.stderr,
+                exit_code=result.return_code,
+                source=source,
+                duration=duration,
             )
-
-        session.add_history(
-            command_text,
-            exit_code=exit_code,
-            duration=duration,
-            source=source,
-        )
-
-        output = getattr(
-            result,
-            "stdout",
-            None,
-        )
-
-        if output is not None:
-            session.set_last_output(
-                str(output)
-            )
+        except (AttributeError, TypeError):
+            # History support should never prevent command
+            # execution from succeeding.
+            pass
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Background execution
-    # -----------------------------------------------------------------------
+    # ========================================================
+    # BACKGROUND EXECUTION
+    # ========================================================
 
     def execute_background(
         self,
-        session: TerminalSession,
-        command: str | Sequence[str],
-        **kwargs,
+        session_id: str,
+        command: str,
+        *,
+        source: str = "human",
+        confirmed: bool = False,
     ):
         """
-        Start a background command.
-
-        Process/job management remains delegated to executor.py.
+        Start a command in the background.
         """
 
         self._ensure_open()
 
-        if session.closed:
-            raise RuntimeExecutionError(
-                "Cannot execute using a closed session."
+        if not command or not command.strip():
+            raise ValueError("Command cannot be empty.")
+
+        session = self.get_session(session_id)
+        context = self.get_context(session_id)
+
+        try:
+            result = self.executor.start_background(
+                command,
+                cwd=context.cwd,
+                environment=context.environment,
+                source=source,
+                confirmed=confirmed,
             )
 
-        executor = self._require_executor()
-
-        context = self.create_context(
-            session
-        )
+        except Exception:
+            self.stats.failed_commands += 1
+            raise
 
         self.stats.commands_executed += 1
-
         self.stats.background_commands += 1
 
-        result = executor.execute_background(
-            command,
-            cwd=context.cwd,
-            env=context.environment,
-            **kwargs,
-        )
+        if result.success:
+            self.stats.successful_commands += 1
+        else:
+            self.stats.failed_commands += 1
+
+        # Register the process with the session.
+        if getattr(result, "pid", None) is not None:
+            try:
+                session.add_job(result.pid)
+            except (AttributeError, TypeError):
+                pass
+
+        # Record history.
+        try:
+            session.add_history(
+                command=command,
+                output=result.stdout,
+                error=result.stderr,
+                exit_code=result.return_code,
+                source=source,
+                duration=0.0,
+            )
+        except (AttributeError, TypeError):
+            pass
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Environment helpers
-    # -----------------------------------------------------------------------
+    # ========================================================
+    # STATISTICS
+    # ========================================================
 
-    def environment(
+    def get_stats(self) -> RuntimeStats:
+        """
+        Return current runtime statistics.
+        """
+
+        self._ensure_open()
+
+        self.stats.active_sessions = len(
+            self.session_manager.list_sessions()
+        )
+
+        return self.stats
+
+    def stats_dict(self) -> dict[str, Any]:
+        """
+        Return runtime statistics as a dictionary.
+        """
+
+        return self.get_stats().to_dict()
+
+    # ========================================================
+    # SESSION SNAPSHOT
+    # ========================================================
+
+    def snapshot(
         self,
         session_id: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
+        """
+        Return a diagnostic snapshot of a session.
+        """
 
-        session = self.get_session(
-            session_id
-        )
+        self._ensure_open()
 
-        return session.export_environment()
+        session = self.get_session(session_id)
 
-    def working_directory(
-        self,
-        session_id: str,
-    ) -> str:
-
-        session = self.get_session(
-            session_id
-        )
-
-        return session.cwd
-
-    # -----------------------------------------------------------------------
-    # Runtime state
-    # -----------------------------------------------------------------------
-
-    def is_running(self) -> bool:
-
-        return not self.closed
-
-    @property
-    def uptime(self) -> float:
-
-        return max(
-            0.0,
-            time.time() - self.started_at,
-        )
-
-    def status(self) -> dict[str, Any]:
-
-        self._update_session_stats()
+        try:
+            session_snapshot = session.snapshot()
+        except AttributeError:
+            session_snapshot = {
+                "session_id": session.session_id,
+                "cwd": session.cwd,
+                "environment": dict(session.environment),
+                "maple_loaded": session.is_maple_loaded(),
+            }
 
         return {
-            "version": __version__,
-            "running": not self.closed,
-            "uptime": self.uptime,
-            "sessions": self.stats.active_sessions,
-            "stats": self.stats.to_dict(),
+            "runtime": self.stats_dict(),
+            "session": session_snapshot,
         }
 
 
-# ---------------------------------------------------------------------------
-# Default runtime
-# ---------------------------------------------------------------------------
+# ============================================================
+# DEFAULT RUNTIME
+# ============================================================
 
-_default_runtime: Optional[
-    TerminalRuntime
-] = None
+_default_runtime: Optional[TerminalRuntime] = None
 
 
 def get_runtime() -> TerminalRuntime:
-    """Return the shared Convexity terminal runtime."""
+    """
+    Return the process-wide default Convexity runtime.
+    """
 
     global _default_runtime
 
-    if _default_runtime is None:
+    if _default_runtime is None or _default_runtime.closed:
         _default_runtime = TerminalRuntime()
 
     return _default_runtime
 
 
-def create_runtime(
-    *,
-    executor: Optional[
-        CommandExecutor
-    ] = None,
-) -> TerminalRuntime:
+def close_runtime() -> None:
+    """
+    Close the default runtime.
+    """
 
-    return TerminalRuntime(
-        executor=executor
+    global _default_runtime
+
+    if _default_runtime is not None:
+        _default_runtime.close()
+        _default_runtime = None
+
+
+# ============================================================
+# CONVENIENCE FUNCTIONS
+# ============================================================
+
+def execute_command(
+    session_id: str,
+    command: str,
+    *,
+    source: str = "human",
+    confirmed: bool = False,
+    timeout: Optional[int] = None,
+):
+    """
+    Convenience wrapper around TerminalRuntime.execute().
+    """
+
+    return get_runtime().execute(
+        session_id,
+        command,
+        source=source,
+        confirmed=confirmed,
+        timeout=timeout,
     )
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def execute_background(
+    session_id: str,
+    command: str,
+    *,
+    source: str = "human",
+    confirmed: bool = False,
+):
+    """
+    Convenience wrapper around TerminalRuntime.execute_background().
+    """
+
+    return get_runtime().execute_background(
+        session_id,
+        command,
+        source=source,
+        confirmed=confirmed,
+    )
+
 
 __all__ = [
     "ExecutionContext",
     "RuntimeStats",
-    "TerminalRuntime",
     "RuntimeErrorBase",
     "RuntimeClosedError",
     "RuntimeExecutionError",
+    "TerminalRuntime",
     "get_runtime",
-    "create_runtime",
+    "close_runtime",
+    "execute_command",
+    "execute_background",
 ]
