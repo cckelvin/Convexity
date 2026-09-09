@@ -1,0 +1,8 @@
+{
+  "name": "Convexity",
+  "description": "An AI-native operating environment and interactive development terminal with multi-session management, virtual filesystem, process manager, and Maple AI agent copilot.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
