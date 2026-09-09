@@ -1,31 +1,26 @@
 """
-Convexity Filesystem Engine
-Version 0.2.0
+Convexity Native Filesystem Engine
+Version 1.0.0
 
-Provides Convexity-native filesystem operations:
+Responsibilities:
+- Native filesystem operations
+- Path resolution
+- Directory listing
+- File creation and reading
+- File writing and appending
+- Copy / move / rename
+- Delete
+- Search / grep
+- Metadata
+- File and directory sizes
+- Existence checks
+- Session-relative path support
 
-- pwd
-- ls
-- cd
-- mkdir
-- touch
-- cat
-- write
-- append
-- rm
-- copy
-- move
-- exists
-- file/directory detection
-- recursive search
-- glob
-- metadata
-- file sizes
-- directory sizes
-- rename
-- safe path validation
+Architecture:
+    TerminalSession owns the current working directory.
+    Filesystem owns filesystem operations.
 
-All filesystem access passes through Convexity's security layer.
+This module NEVER changes the process-wide cwd with os.chdir().
 """
 
 from __future__ import annotations
@@ -34,14 +29,12 @@ import fnmatch
 import os
 import shutil
 import stat
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator, List, Optional
+from typing import Iterator, List, Optional
 
 from .config import config
 from .security import (
-    PermissionDenied,
     SecurityError,
     check_file_operation,
     check_permission,
@@ -49,9 +42,10 @@ from .security import (
 )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # FILE INFORMATION
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 @dataclass
 class FileInfo:
@@ -73,6 +67,10 @@ class FileInfo:
     def is_directory(self) -> bool:
         return self.type == "directory"
 
+    @property
+    def is_symlink(self) -> bool:
+        return self.type == "symlink"
+
     def to_dict(self) -> dict:
         return {
             "path": self.path,
@@ -85,68 +83,117 @@ class FileInfo:
         }
 
 
-# ---------------------------------------------------------------------------
-# CURRENT DIRECTORY
-# ---------------------------------------------------------------------------
+# ============================================================================
+# PATH RESOLUTION
+# ============================================================================
+
+
+def resolve_path(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+    must_exist: bool = False,
+    allow_missing: bool = True,
+) -> Path:
+    """
+    Resolve a path relative to an optional session cwd.
+
+    This is the primary path-resolution function used by the filesystem
+    engine.
+
+    Example:
+
+        resolve_path("app.py", cwd="/project")
+
+    ->
+
+        /project/app.py
+    """
+
+    if path is None:
+        raise SecurityError("Path cannot be None.")
+
+    raw = str(path).strip()
+
+    if not raw:
+        raise SecurityError("Path cannot be empty.")
+
+    path_obj = Path(raw).expanduser()
+
+    if not path_obj.is_absolute() and cwd is not None:
+        path_obj = Path(cwd).expanduser() / path_obj
+
+    return validate_path(
+        path_obj,
+        must_exist=must_exist,
+        allow_missing=allow_missing,
+    )
+
 
 def get_current_directory() -> Path:
-    """Return Convexity's current working directory."""
+    """
+    Return the process cwd.
+
+    Session-aware callers should normally use TerminalSession.cwd instead.
+    """
 
     return Path.cwd()
 
 
 def get_current_directory_string() -> str:
-    """Return the current directory as a string."""
+    """Return the process cwd as a string."""
 
     return str(get_current_directory())
 
 
-def change_directory(path: str) -> Path:
+def change_directory(
+    path: str,
+    *,
+    cwd: str | Path | None = None,
+) -> Path:
     """
-    Change Convexity's process working directory.
+    Validate a directory and return the new path.
 
-    The terminal integration layer can later replace this with a
-    per-session virtual working directory.
+    IMPORTANT:
+        This does NOT call os.chdir().
+
+    TerminalSession is responsible for storing the new cwd.
     """
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
     if not target.is_dir():
         raise SecurityError(
             f"Not a directory: {target}"
         )
-
-    os.chdir(target)
 
     return target
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # DIRECTORY OPERATIONS
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def list_directory(
     path: str = ".",
     *,
+    cwd: str | Path | None = None,
     show_hidden: bool = False,
     recursive: bool = False,
 ) -> List[FileInfo]:
-    """
-    List directory contents.
+    """List the contents of a directory."""
 
-    Examples:
-
-        list_directory(".")
-        list_directory(".", show_hidden=True)
-        list_directory(".", recursive=True)
-    """
-
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
     if not target.is_dir():
@@ -154,22 +201,22 @@ def list_directory(
             f"Not a directory: {target}"
         )
 
-    results: List[FileInfo] = []
+    iterator: Iterator[Path]
 
     if recursive:
         iterator = target.rglob("*")
     else:
         iterator = target.iterdir()
 
-    for item in iterator:
+    results: List[FileInfo] = []
 
+    for item in iterator:
         if not show_hidden and is_hidden(item):
             continue
 
         try:
             results.append(get_file_info(item))
         except OSError:
-            # A disappearing or inaccessible file should not break ls.
             continue
 
     results.sort(
@@ -185,13 +232,15 @@ def list_directory(
 def make_directory(
     path: str,
     *,
+    cwd: str | Path | None = None,
     parents: bool = True,
     exist_ok: bool = True,
 ) -> Path:
     """Create a directory."""
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         allow_missing=True,
     )
 
@@ -203,15 +252,21 @@ def make_directory(
     return target
 
 
-# ---------------------------------------------------------------------------
-# FILE CREATION / READING / WRITING
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FILE CREATION
+# ============================================================================
 
-def touch_file(path: str) -> Path:
+
+def touch_file(
+    path: str,
+    *,
+    cwd: str | Path | None = None,
+) -> Path:
     """Create an empty file if it does not exist."""
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         allow_missing=True,
     )
 
@@ -225,28 +280,30 @@ def touch_file(path: str) -> Path:
         exist_ok=True,
     )
 
-    target.touch(
-        exist_ok=True,
-    )
+    target.touch(exist_ok=True)
 
     return target
+
+
+# ============================================================================
+# FILE READING
+# ============================================================================
 
 
 def read_file(
     path: str,
     *,
+    cwd: str | Path | None = None,
     encoding: str = "utf-8",
     max_bytes: Optional[int] = None,
 ) -> str:
-    """
-    Read a text file.
+    """Read a text file with a configurable size limit."""
 
-    Large files are limited to prevent accidental memory exhaustion.
-    """
-
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
     if not target.is_file():
@@ -260,18 +317,22 @@ def read_file(
         else config.MAX_FILE_READ_SIZE
     )
 
+    if limit <= 0:
+        raise SecurityError(
+            "File read limit must be greater than zero."
+        )
+
     try:
         with target.open(
             "r",
             encoding=encoding,
             errors="replace",
         ) as file:
-
             content = file.read(limit)
 
-    except UnicodeDecodeError as exc:
+    except OSError as exc:
         raise SecurityError(
-            f"Unable to decode file as {encoding}: {target}"
+            f"Unable to read file: {target}"
         ) from exc
 
     if target.stat().st_size > limit:
@@ -282,47 +343,61 @@ def read_file(
     return content
 
 
+# ============================================================================
+# FILE WRITING
+# ============================================================================
+
+
 def write_file(
     path: str,
     content: str,
     *,
+    cwd: str | Path | None = None,
     encoding: str = "utf-8",
     overwrite: bool = True,
     source: str = "human",
     confirmed: bool = False,
 ) -> Path:
-    """
-    Write text to a file.
-
-    Existing files require overwrite permission.
-    """
+    """Write text to a file."""
 
     if not isinstance(content, str):
         raise SecurityError(
             "File content must be a string."
         )
 
-    target = check_file_operation(
-        "overwrite" if Path(path).exists() else "write",
+    target = resolve_path(
         path,
-        source=source,
-        confirmed=confirmed,
+        cwd=cwd,
+        allow_missing=True,
     )
 
-    if target.exists() and not overwrite:
-        raise FileExistsError(
-            f"File already exists: {target}"
+    if target.exists():
+        check_file_operation(
+            "overwrite",
+            target,
+            source=source,
+            confirmed=confirmed,
         )
+
+        if not overwrite:
+            raise FileExistsError(
+                f"File already exists: {target}"
+            )
 
     target.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    target.write_text(
-        content,
-        encoding=encoding,
-    )
+    try:
+        target.write_text(
+            content,
+            encoding=encoding,
+        )
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to write file: {target}"
+        ) from exc
 
     return target
 
@@ -331,14 +406,21 @@ def append_file(
     path: str,
     content: str,
     *,
+    cwd: str | Path | None = None,
     encoding: str = "utf-8",
     source: str = "human",
     confirmed: bool = False,
 ) -> Path:
     """Append text to a file."""
 
-    target = validate_path(
+    if not isinstance(content, str):
+        raise SecurityError(
+            "File content must be a string."
+        )
+
+    target = resolve_path(
         path,
+        cwd=cwd,
         allow_missing=True,
     )
 
@@ -354,22 +436,30 @@ def append_file(
         exist_ok=True,
     )
 
-    with target.open(
-        "a",
-        encoding=encoding,
-    ) as file:
-        file.write(content)
+    try:
+        with target.open(
+            "a",
+            encoding=encoding,
+        ) as file:
+            file.write(content)
+
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to append to file: {target}"
+        ) from exc
 
     return target
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # DELETE
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def delete_path(
     path: str,
     *,
+    cwd: str | Path | None = None,
     recursive: bool = False,
     source: str = "human",
     confirmed: bool = False,
@@ -377,18 +467,25 @@ def delete_path(
     """
     Delete a file or directory.
 
-    Recursive directory deletion is explicitly permission-controlled.
+    Recursive directory deletion requires explicit confirmation when
+    the source is Maple.
     """
 
-    target = check_file_operation(
-        "delete",
+    target = resolve_path(
         path,
+        cwd=cwd,
+        allow_missing=True,
+    )
+
+    if not target.exists() and not target.is_symlink():
+        return False
+
+    check_file_operation(
+        "delete",
+        target,
         source=source,
         confirmed=confirmed,
     )
-
-    if not target.exists():
-        return False
 
     if target.is_symlink():
         target.unlink()
@@ -415,8 +512,8 @@ def delete_path(
             return True
         except OSError as exc:
             raise SecurityError(
-                f"Directory is not empty. "
-                f"Use recursive deletion with confirmation: {target}"
+                "Directory is not empty. "
+                "Use recursive deletion if intended."
             ) from exc
 
     raise SecurityError(
@@ -424,27 +521,32 @@ def delete_path(
     )
 
 
-# ---------------------------------------------------------------------------
-# COPY / MOVE / RENAME
-# ---------------------------------------------------------------------------
+# ============================================================================
+# COPY
+# ============================================================================
+
 
 def copy_path(
     source_path: str,
     destination: str,
     *,
+    cwd: str | Path | None = None,
     overwrite: bool = False,
     source: str = "human",
     confirmed: bool = False,
 ) -> Path:
     """Copy a file or directory."""
 
-    source_target = validate_path(
+    source_target = resolve_path(
         source_path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
-    destination_target = validate_path(
+    destination_target = resolve_path(
         destination,
+        cwd=cwd,
         allow_missing=True,
     )
 
@@ -452,7 +554,8 @@ def copy_path(
 
         if not overwrite:
             raise FileExistsError(
-                f"Destination already exists: {destination_target}"
+                f"Destination already exists: "
+                f"{destination_target}"
             )
 
         check_permission(
@@ -466,41 +569,54 @@ def copy_path(
         exist_ok=True,
     )
 
-    if source_target.is_dir():
+    try:
+        if source_target.is_dir():
+            shutil.copytree(
+                source_target,
+                destination_target,
+                dirs_exist_ok=overwrite,
+            )
+        else:
+            shutil.copy2(
+                source_target,
+                destination_target,
+            )
 
-        shutil.copytree(
-            source_target,
-            destination_target,
-            dirs_exist_ok=overwrite,
-        )
-
-    else:
-
-        shutil.copy2(
-            source_target,
-            destination_target,
-        )
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to copy '{source_target}' "
+            f"to '{destination_target}'"
+        ) from exc
 
     return destination_target
+
+
+# ============================================================================
+# MOVE
+# ============================================================================
 
 
 def move_path(
     source_path: str,
     destination: str,
     *,
+    cwd: str | Path | None = None,
     overwrite: bool = False,
     source: str = "human",
     confirmed: bool = False,
 ) -> Path:
     """Move a file or directory."""
 
-    source_target = validate_path(
+    source_target = resolve_path(
         source_path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
-    destination_target = validate_path(
+    destination_target = resolve_path(
         destination,
+        cwd=cwd,
         allow_missing=True,
     )
 
@@ -508,7 +624,8 @@ def move_path(
 
         if not overwrite:
             raise FileExistsError(
-                f"Destination already exists: {destination_target}"
+                f"Destination already exists: "
+                f"{destination_target}"
             )
 
         check_permission(
@@ -522,36 +639,60 @@ def move_path(
         exist_ok=True,
     )
 
-    shutil.move(
-        str(source_target),
-        str(destination_target),
-    )
+    try:
+        shutil.move(
+            str(source_target),
+            str(destination_target),
+        )
+
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to move '{source_target}' "
+            f"to '{destination_target}'"
+        ) from exc
 
     return destination_target
+
+
+# ============================================================================
+# RENAME
+# ============================================================================
 
 
 def rename_path(
     path: str,
     new_name: str,
     *,
+    cwd: str | Path | None = None,
     source: str = "human",
     confirmed: bool = False,
 ) -> Path:
     """Rename a filesystem object."""
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
-    if not new_name or "/" in new_name or "\\" in new_name:
+    if not new_name:
+        raise SecurityError(
+            "New name cannot be empty."
+        )
+
+    if (
+        "/" in new_name
+        or "\\" in new_name
+        or new_name in {".", ".."}
+    ):
         raise SecurityError(
             "New name must be a single filename."
         )
 
     destination = target.parent / new_name
 
-    destination = validate_path(
+    destination = resolve_path(
         destination,
         allow_missing=True,
     )
@@ -563,36 +704,40 @@ def rename_path(
             confirmed=confirmed,
         )
 
-    target.rename(destination)
+    try:
+        target.rename(destination)
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to rename '{target}' "
+            f"to '{destination}'"
+        ) from exc
 
     return destination
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # SEARCH
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def search_files(
     path: str = ".",
     pattern: str = "*",
     *,
+    cwd: str | Path | None = None,
     recursive: bool = True,
     files_only: bool = False,
     directories_only: bool = False,
 ) -> List[Path]:
     """
-    Search for files/directories using wildcard matching.
-
-    Examples:
-
-        search_files(".", "*.py")
-        search_files(".", "*.json")
-        search_files(".", "README*")
+    Search for filesystem objects using wildcard matching.
     """
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
     if not target.is_dir():
@@ -634,15 +779,16 @@ def find_text(
     path: str = ".",
     text: str = "",
     *,
+    cwd: str | Path | None = None,
     recursive: bool = True,
     case_sensitive: bool = False,
 ) -> List[tuple[Path, int, str]]:
     """
-    Search text inside files.
+    Search for text inside files.
 
     Returns:
 
-        (file_path, line_number, matching_line)
+        (path, line_number, matching_line)
     """
 
     if not text:
@@ -650,15 +796,18 @@ def find_text(
             "Search text cannot be empty."
         )
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
     if target.is_file():
         candidates = [target]
 
-    else:
+    elif target.is_dir():
+
         iterator = (
             target.rglob("*")
             if recursive
@@ -671,7 +820,12 @@ def find_text(
             if item.is_file()
         ]
 
-    results = []
+    else:
+        raise SecurityError(
+            f"Unsupported search target: {target}"
+        )
+
+    results: List[tuple[Path, int, str]] = []
 
     needle = (
         text
@@ -688,7 +842,7 @@ def find_text(
                 errors="replace",
             ) as file:
 
-                for number, line in enumerate(
+                for line_number, line in enumerate(
                     file,
                     start=1,
                 ):
@@ -703,39 +857,49 @@ def find_text(
                         results.append(
                             (
                                 file_path,
-                                number,
+                                line_number,
                                 line.rstrip("\n"),
                             )
                         )
 
-        except (OSError, UnicodeError):
+        except OSError:
             continue
 
     return results
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # METADATA
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 
 def get_file_info(
     path: str | Path,
+    *,
+    cwd: str | Path | None = None,
 ) -> FileInfo:
-    """Return structured filesystem metadata."""
+    """Return metadata for a filesystem object."""
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
-    information = target.stat()
+    try:
+        information = target.stat()
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to inspect: {target}"
+        ) from exc
 
-    if target.is_dir():
+    if target.is_symlink():
+        object_type = "symlink"
+    elif target.is_dir():
         object_type = "directory"
     elif target.is_file():
         object_type = "file"
-    elif target.is_symlink():
-        object_type = "symlink"
     else:
         object_type = "other"
 
@@ -752,202 +916,303 @@ def get_file_info(
     )
 
 
-def get_file_size(path: str | Path) -> int:
-    """Return file size in bytes."""
+def get_file_size(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+) -> int:
+    """Return the size of a filesystem object in bytes."""
 
-    target = validate_path(
+    target = resolve_path(
         path,
+        cwd=cwd,
         must_exist=True,
+        allow_missing=False,
     )
 
-    return target.stat().st_size
-
-
-def get_directory_size(path: str | Path) -> int:
-    """Calculate total size of files under a directory."""
-
-    target = validate_path(
-        path,
-        must_exist=True,
-    )
-
-    if target.is_file():
+    try:
         return target.stat().st_size
+    except OSError as exc:
+        raise SecurityError(
+            f"Unable to determine size: {target}"
+        ) from exc
+
+
+def get_directory_size(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+) -> int:
+    """Return the total size of files inside a directory."""
+
+    target = resolve_path(
+        path,
+        cwd=cwd,
+        must_exist=True,
+        allow_missing=False,
+    )
+
+    if not target.is_dir():
+        raise SecurityError(
+            f"Not a directory: {target}"
+        )
 
     total = 0
 
     for item in target.rglob("*"):
 
+        if not item.is_file():
+            continue
+
         try:
-            if item.is_file():
-                total += item.stat().st_size
+            total += item.stat().st_size
         except OSError:
             continue
 
     return total
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # EXISTENCE / TYPE
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def exists(path: str | Path) -> bool:
+
+def exists(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+) -> bool:
     """Return whether a path exists."""
 
     try:
-        return validate_path(
+        target = resolve_path(
             path,
+            cwd=cwd,
             allow_missing=True,
-        ).exists()
+        )
+
+        return target.exists() or target.is_symlink()
 
     except SecurityError:
         return False
 
 
-def is_file(path: str | Path) -> bool:
+def is_file(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+) -> bool:
     """Return whether a path is a file."""
 
     try:
-        return validate_path(
+        return resolve_path(
             path,
+            cwd=cwd,
             must_exist=True,
+            allow_missing=False,
         ).is_file()
-
     except SecurityError:
         return False
 
 
-def is_directory(path: str | Path) -> bool:
+def is_directory(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+) -> bool:
     """Return whether a path is a directory."""
 
     try:
-        return validate_path(
+        return resolve_path(
             path,
+            cwd=cwd,
             must_exist=True,
+            allow_missing=False,
         ).is_dir()
-
     except SecurityError:
         return False
 
 
 def is_hidden(path: str | Path) -> bool:
-    """Determine whether a filesystem object is hidden."""
+    """
+    Determine whether a filesystem object is hidden.
+
+    Unix:
+        Names beginning with '.' are hidden.
+
+    Windows:
+        The hidden file attribute is checked when available.
+    """
 
     target = Path(path)
 
-    # Unix hidden-file convention.
     if target.name.startswith("."):
         return True
 
-    # Windows hidden attribute.
-    if os.name == "nt" and target.exists():
-
+    if os.name == "nt":
         try:
-            attributes = getattr(
-                target.stat(),
-                "st_file_attributes",
-                0,
+            import ctypes
+
+            attributes = ctypes.windll.kernel32.GetFileAttributesW(
+                str(target)
             )
 
-            return bool(
-                attributes & getattr(
-                    stat,
-                    "FILE_ATTRIBUTE_HIDDEN",
-                    0x2,
+            if attributes != -1:
+                FILE_ATTRIBUTE_HIDDEN = 0x2
+
+                return bool(
+                    attributes & FILE_ATTRIBUTE_HIDDEN
                 )
-            )
 
-        except OSError:
-            return False
+        except Exception:
+            pass
 
     return False
 
 
-# ---------------------------------------------------------------------------
-# DIRECTORY WALK
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GLOB
+# ============================================================================
 
-def walk(
-    path: str = ".",
-) -> Generator[tuple[str, List[str], List[str]], None, None]:
+
+def glob(
+    pattern: str,
+    *,
+    cwd: str | Path | None = None,
+    recursive: bool = False,
+) -> List[Path]:
     """
-    Walk a directory tree.
-
-    Yields:
-
-        root, directories, files
+    Resolve a glob pattern relative to a session cwd.
     """
 
-    target = validate_path(
-        path,
+    base = (
+        Path(cwd).expanduser()
+        if cwd is not None
+        else Path.cwd()
+    )
+
+    base = validate_path(
+        base,
         must_exist=True,
+        allow_missing=False,
+    )
+
+    if recursive:
+        results = base.glob(pattern)
+    else:
+        results = base.glob(pattern)
+
+    return sorted(
+        results,
+        key=lambda value: str(value).lower(),
+    )
+
+
+# ============================================================================
+# DIRECTORY ITERATION
+# ============================================================================
+
+
+def iter_directory(
+    path: str = ".",
+    *,
+    cwd: str | Path | None = None,
+) -> Iterator[Path]:
+    """Yield directory entries."""
+
+    target = resolve_path(
+        path,
+        cwd=cwd,
+        must_exist=True,
+        allow_missing=False,
     )
 
     if not target.is_dir():
         raise SecurityError(
-            f"Walk root is not a directory: {target}"
+            f"Not a directory: {target}"
         )
 
-    for root, directories, files in os.walk(target):
-        yield root, directories, files
+    yield from target.iterdir()
 
 
-# ---------------------------------------------------------------------------
-# PATH UTILITIES
-# ---------------------------------------------------------------------------
-
-def absolute_path(path: str) -> Path:
-    """Return a validated absolute path."""
-
-    return validate_path(
-        path,
-        allow_missing=True,
-    )
+# ============================================================================
+# COMPATIBILITY ALIASES
+# ============================================================================
 
 
-def parent_directory(path: str) -> Path:
-    """Return the validated parent directory."""
+# Common names used by the terminal/builtins layer.
 
-    target = validate_path(
-        path,
-        allow_missing=True,
-    )
+ls = list_directory
+mkdir = make_directory
+touch = touch_file
+cat = read_file
+read = read_file
+write = write_file
+append = append_file
+rm = delete_path
+copy = copy_path
+move = move_path
+rename = rename_path
+find = search_files
+grep = find_text
+stat_file = get_file_info
 
-    return validate_path(
-        target.parent,
-        allow_missing=True,
-    )
 
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
-# ---------------------------------------------------------------------------
-# EXPORTS
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "FileInfo",
+
+    "resolve_path",
+
     "get_current_directory",
     "get_current_directory_string",
     "change_directory",
+
     "list_directory",
     "make_directory",
+
     "touch_file",
     "read_file",
     "write_file",
     "append_file",
+
     "delete_path",
+
     "copy_path",
     "move_path",
     "rename_path",
+
     "search_files",
     "find_text",
+
     "get_file_info",
     "get_file_size",
     "get_directory_size",
+
     "exists",
     "is_file",
     "is_directory",
     "is_hidden",
-    "walk",
-    "absolute_path",
-    "parent_directory",
+
+    "glob",
+    "iter_directory",
+
+    "ls",
+    "mkdir",
+    "touch",
+    "cat",
+    "read",
+    "write",
+    "append",
+    "rm",
+    "copy",
+    "move",
+    "rename",
+    "find",
+    "grep",
+    "stat_file",
 ]
