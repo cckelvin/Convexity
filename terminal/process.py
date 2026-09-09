@@ -824,4 +824,133 @@ class ProcessManager:
 
             finished = []
 
-            for process_id, process in self._pr
+            for process_id, process in self._processes.items():
+
+                if process.poll() is not None:
+
+                    finished.append(process_id)
+
+            for process_id in finished:
+
+                self._processes.pop(
+                    process_id,
+                    None,
+                )
+
+    # -----------------------------------------------------------------------
+    # TERMINATE
+    # -----------------------------------------------------------------------
+
+    def terminate(
+        self,
+        process_id: int,
+    ) -> bool:
+
+        process = self.get(process_id)
+
+        if process is None:
+            return False
+
+        return process.terminate()
+
+    # -----------------------------------------------------------------------
+    # KILL
+    # -----------------------------------------------------------------------
+
+    def kill(
+        self,
+        process_id: int,
+    ) -> bool:
+
+        process = self.get(process_id)
+
+        if process is None:
+            return False
+
+        return process.kill()
+
+    # -----------------------------------------------------------------------
+    # SIGNAL
+    # -----------------------------------------------------------------------
+
+    def send_signal(
+        self,
+        process_id: int,
+        sig: int,
+    ) -> bool:
+
+        process = self.get(process_id)
+
+        if process is None:
+            return False
+
+        return process.send_signal(sig)
+
+    # -----------------------------------------------------------------------
+    # WAIT
+    # -----------------------------------------------------------------------
+
+    def wait(
+        self,
+        process_id: int,
+        timeout: Optional[float] = None,
+    ) -> int:
+
+        process = self.get(process_id)
+
+        if process is None:
+            raise KeyError(
+                f"Unknown process ID: {process_id}"
+            )
+
+        return process.wait(timeout)
+
+    # -----------------------------------------------------------------------
+    # WRITE
+    # -----------------------------------------------------------------------
+
+    def write(
+        self,
+        process_id: int,
+        data: str,
+    ) -> bool:
+
+        process = self.get(process_id)
+
+        if process is None:
+            return False
+
+        process.write(data)
+
+        return True
+
+    # -----------------------------------------------------------------------
+    # CLEAR
+    # -----------------------------------------------------------------------
+
+    def clear_finished(self) -> None:
+        self.remove_finished()
+
+    # -----------------------------------------------------------------------
+    # TERMINATE ALL
+    # -----------------------------------------------------------------------
+
+    def terminate_all(self) -> None:
+
+        with self._lock:
+
+            processes = list(
+                self._processes.values()
+            )
+
+        for process in processes:
+
+            if process.poll() is None:
+                process.terminate()
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL PROCESS MANAGER
+# ---------------------------------------------------------------------------
+
+process_manager = ProcessManager()
