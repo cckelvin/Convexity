@@ -1,780 +1,440 @@
 """
 Convexity Terminal
-Version 0.2.0
+Version: 1.0.1
 
-Main interactive shell for Convexity.
+Interactive user-facing terminal interface.
 
 Architecture:
 
     User
       ↓
-    Convexity Terminal
+    Terminal
       ↓
-    Command Parser
+    TerminalRuntime
       ↓
-    Security Layer
+    Session
       ↓
-    Executor / Filesystem
+    Executor
       ↓
     Operating System
+
+Maple is optional. When loaded, Maple can analyze and
+authorize actions, but manual terminal usage remains available.
 """
 
 from __future__ import annotations
 
 import os
-import readline
+import platform
 import shlex
 import sys
-from pathlib import Path
 from typing import Optional
 
-from .config import config
-from .executor import (
-    execute_command,
-    execute_pipeline,
-    start_background,
-    list_processes,
-    terminate_process,
-    kill_process,
-)
-from .filesystem import (
-    get_current_directory,
-    list_directory,
-    change_directory,
-    make_directory,
-    touch_file,
-    read_file,
-    write_file,
-    append_file,
-    delete_path,
-    copy_path,
-    move_path,
-    rename_path,
-    search_files,
-    find_text,
-    get_file_info,
-    get_file_size,
-    get_directory_size,
-    exists,
-)
-from .security import SecurityError, PermissionDenied
+from .runtime import TerminalRuntime, get_runtime
+from .session import TerminalSession
+
+
+__version__ = "1.0.1"
 
 
 class ConvexityTerminal:
-    """Main Convexity terminal interface."""
+    """
+    Main interactive Convexity terminal.
+    """
 
-    def __init__(self) -> None:
-        self.running = False
-        self.version = config.VERSION
-        self.history_file = config.get_history_path()
+    def __init__(
+        self,
+        *,
+        runtime: Optional[TerminalRuntime] = None,
+        session: Optional[TerminalSession] = None,
+    ) -> None:
 
-        self._setup_history()
+        self.runtime = runtime or get_runtime()
 
-    # ------------------------------------------------------------------
-    # START
-    # ------------------------------------------------------------------
+        if session is None:
+            sessions = self.runtime.list_sessions()
 
-    def start(self) -> None:
-        """Start the interactive Convexity terminal."""
+            if sessions:
+                self.session = sessions[0]
+            else:
+                self.session = self.runtime.create_session()
+
+        else:
+            self.session = session
 
         self.running = True
 
-        self._print_banner()
+    # ========================================================
+    # PROPERTIES
+    # ========================================================
+
+    @property
+    def session_id(self) -> str:
+        return self.session.session_id
+
+    @property
+    def cwd(self) -> str:
+        return self.session.cwd
+
+    # ========================================================
+    # PROMPT
+    # ========================================================
+
+    def build_prompt(self) -> str:
+        """
+        Build the terminal prompt.
+        """
+
+        maple_state = ""
+
+        try:
+            if self.session.is_maple_loaded():
+                maple_state = " [Maple]"
+        except AttributeError:
+            pass
+
+        directory = self.cwd
+
+        try:
+            home = os.path.expanduser("~")
+
+            if directory.startswith(home):
+                directory = "~" + directory[len(home):]
+
+        except Exception:
+            pass
+
+        return f"convexity:{directory}{maple_state}> "
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    def run(self) -> None:
+        """
+        Start the interactive terminal.
+        """
+
+        self.running = True
+
+        self.print_banner()
 
         while self.running:
 
             try:
-                prompt = self._build_prompt()
-
-                command = input(prompt)
-
-                command = command.strip()
-
-                if not command:
-                    continue
-
-                self.process_command(command)
-
-            except KeyboardInterrupt:
-                print("\nUse 'exit' to leave Convexity.")
+                command = input(self.build_prompt())
 
             except EOFError:
                 print()
-                self.running = False
+                break
+
+            except KeyboardInterrupt:
+                print()
+                continue
+
+            command = command.strip()
+
+            if not command:
+                continue
+
+            try:
+                self.handle_command(command)
+
+            except KeyboardInterrupt:
+                print("^C")
 
             except Exception as exc:
-                print(f"Convexity error: {exc}")
+                print(f"convexity: error: {exc}")
 
-        self._save_history()
+    # ========================================================
+    # BANNER
+    # ========================================================
 
-    # ------------------------------------------------------------------
-    # COMMAND PROCESSING
-    # ------------------------------------------------------------------
+    def print_banner(self) -> None:
+        print()
+        print("Convexity Terminal")
+        print(f"Version {__version__}")
+        print(f"Platform: {platform.system()}")
+        print("Type 'help' for commands.")
+        print()
 
-    def process_command(self, command_str: str) -> None:
-        """Process a single command."""
+    # ========================================================
+    # COMMAND DISPATCH
+    # ========================================================
 
-        command_str = command_str.strip()
-
-        if not command_str:
-            return
+    def handle_command(self, command: str) -> None:
+        """
+        Dispatch a command.
+        """
 
         try:
-            tokens = shlex.split(
-                command_str,
-                posix=(os.name != "nt"),
-            )
+            parts = shlex.split(command)
 
         except ValueError as exc:
-            print(f"Syntax error: {exc}")
+            print(f"parse error: {exc}")
             return
 
-        if not tokens:
+        if not parts:
             return
 
-        command = tokens[0].lower()
-        args = tokens[1:]
+        name = parts[0].lower()
+        args = parts[1:]
 
-        # --------------------------------------------------------------
-        # SHELL CONTROL
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
+        # Terminal control
+        # ----------------------------------------------------
 
-        if command in {"exit", "quit"}:
-            self.running = False
-            print("Goodbye.")
+        if name in {"exit", "quit"}:
+            self.command_exit()
             return
 
-        if command == "help":
-            self.show_help()
+        if name == "help":
+            self.command_help()
             return
 
-        if command == "clear":
-            self.clear()
+        if name == "clear":
+            self.command_clear()
             return
 
-        if command == "version":
-            print(
-                f"{config.APP_NAME} "
-                f"{config.VERSION}"
-            )
+        # ----------------------------------------------------
+        # Session
+        # ----------------------------------------------------
+
+        if name == "pwd":
+            self.command_pwd()
             return
 
-        # --------------------------------------------------------------
-        # DIRECTORY
-        # --------------------------------------------------------------
-
-        if command in {"pwd", "cwd"}:
-            print(get_current_directory())
-            return
-
-        if command in {"cd", "chdir"}:
+        if name == "cd":
             self.command_cd(args)
             return
 
-        if command in {"ls", "dir"}:
-            self.command_ls(args)
+        if name in {"history", "hist"}:
+            self.command_history(args)
             return
 
-        # --------------------------------------------------------------
-        # FILESYSTEM
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
+        # Environment
+        # ----------------------------------------------------
 
-        if command == "mkdir":
-            self.command_mkdir(args)
-            return
-
-        if command == "touch":
-            self.command_touch(args)
-            return
-
-        if command in {"cat", "read"}:
-            self.command_cat(args)
-            return
-
-        if command in {"write", "set-content"}:
-            self.command_write(args)
-            return
-
-        if command in {"append", "add-content"}:
-            self.command_append(args)
-            return
-
-        if command in {"rm", "del", "delete"}:
-            self.command_rm(args)
-            return
-
-        if command in {"cp", "copy"}:
-            self.command_copy(args)
-            return
-
-        if command in {"mv", "move"}:
-            self.command_move(args)
-            return
-
-        if command == "rename":
-            self.command_rename(args)
-            return
-
-        if command in {"exists", "test-path"}:
-            self.command_exists(args)
-            return
-
-        if command in {"stat", "info"}:
-            self.command_info(args)
-            return
-
-        if command in {"size", "du"}:
-            self.command_size(args)
-            return
-
-        if command in {"find", "search"}:
-            self.command_find(args)
-            return
-
-        if command in {"grep", "findtext"}:
-            self.command_grep(args)
-            return
-
-        # --------------------------------------------------------------
-        # PROCESS MANAGEMENT
-        # --------------------------------------------------------------
-
-        if command in {"jobs", "ps"}:
-            self.command_processes()
-            return
-
-        if command in {"kill", "stop"}:
-            self.command_kill(args)
-            return
-
-        if command in {"bg", "background"}:
-            self.command_background(args)
-            return
-
-        # --------------------------------------------------------------
-        # ENVIRONMENT
-        # --------------------------------------------------------------
-
-        if command in {"env", "environment"}:
+        if name == "env":
             self.command_env()
             return
 
-        if command == "set":
+        if name == "set":
             self.command_set(args)
             return
 
-        if command == "unset":
+        if name == "unset":
             self.command_unset(args)
             return
 
-        # --------------------------------------------------------------
-        # SHELL OPERATORS
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
+        # Maple state
+        # ----------------------------------------------------
 
-        if self._contains_shell_operator(command_str):
-            self.command_shell(command_str)
+        if name == "load" and args and args[0].lower() == "maple":
+            self.command_load_maple()
             return
 
-        # --------------------------------------------------------------
-        # EXTERNAL COMMAND
-        # --------------------------------------------------------------
+        if name == "kill" and args and args[0].lower() == "maple":
+            self.command_kill_maple()
+            return
 
-        self.command_external(command_str)
+        # ----------------------------------------------------
+        # System
+        # ----------------------------------------------------
 
-    # ------------------------------------------------------------------
+        if name == "whoami":
+            self.command_external(command)
+            return
+
+        if name == "hostname":
+            self.command_external(command)
+            return
+
+        if name in {"sysinfo", "systeminfo"}:
+            self.command_sysinfo()
+            return
+
+        # ----------------------------------------------------
+        # Jobs/processes
+        # ----------------------------------------------------
+
+        if name in {"jobs", "ps"}:
+            self.command_processes()
+            return
+
+        # ----------------------------------------------------
+        # Everything else
+        # ----------------------------------------------------
+
+        self.command_external(command)
+
+    # ========================================================
     # HELP
-    # ------------------------------------------------------------------
+    # ========================================================
 
-    def show_help(self) -> None:
+    def command_help(self) -> None:
         print(
             """
-Convexity Terminal
-==================
+Convexity Terminal Commands
+----------------------------
+
+Terminal:
+  help                 Show this help
+  clear                Clear the screen
+  exit                 Exit Convexity
 
 Navigation:
-  pwd                         Show current directory
-  cd <path>                   Change directory
-  ls [path]                   List directory
-  dir [path]                  Alias for ls
-
-Files:
-  mkdir <path>                Create directory
-  touch <file>                Create file
-  cat <file>                  Read file
-  write <file> <text>         Write file
-  append <file> <text>        Append to file
-  rm <path>                   Delete
-  cp <src> <dst>              Copy
-  mv <src> <dst>              Move
-  rename <path> <name>        Rename
-
-Search:
-  find <path> <pattern>       Find files
-  grep <path> <text>          Search text
-  exists <path>               Check path
-  stat <path>                 File information
-  size <path>                 Size
-
-Processes:
-  ps                          List Convexity processes
-  jobs                        List background processes
-  bg <command>                Start background process
-  kill <pid>                  Terminate process
+  pwd                  Show current directory
+  cd <path>            Change directory
 
 Environment:
-  env                         Show environment
-  set <name> <value>          Set environment variable
-  unset <name>                Remove variable
+  env                  Show environment variables
+  set <name> <value>   Set a variable
+  unset <name>         Remove a variable
 
-Shell:
-  command1 | command2         Pipeline
-  command1 > file             Redirection (shell engine)
-  command1 >> file            Append redirection
-  command1 && command2        Conditional execution
-  command1 || command2        Conditional fallback
+History:
+  history              Show command history
+
+Processes:
+  jobs                 Show active jobs
+  ps                   Show processes
+
+Maple:
+  load maple           Activate Maple
+  kill maple           Deactivate Maple
 
 System:
-  help                        Show this help
-  clear                       Clear terminal
-  version                     Show version
-  exit                        Exit Convexity
+  whoami               Current user
+  hostname             Computer name
+  sysinfo              System information
 
-Any external executable available to Convexity's runtime can be passed
-to the execution engine.
+External commands:
+  Any supported system command can be entered directly.
+
+Examples:
+  python script.py
+  git status
+  npm install
+  ls
+  cd projects
+  load maple
+  kill maple
 """
         )
 
-    # ------------------------------------------------------------------
-    # DIRECTORY COMMANDS
-    # ------------------------------------------------------------------
+    # ========================================================
+    # EXIT
+    # ========================================================
+
+    def command_exit(self) -> None:
+        self.running = False
+
+    # ========================================================
+    # CLEAR
+    # ========================================================
+
+    def command_clear(self) -> None:
+        os.system("cls" if os.name == "nt" else "clear")
+
+    # ========================================================
+    # PWD
+    # ========================================================
+
+    def command_pwd(self) -> None:
+        print(self.session.cwd)
+
+    # ========================================================
+    # CD
+    # ========================================================
 
     def command_cd(self, args: list[str]) -> None:
 
         if not args:
-            target = Path.home()
+            target = os.path.expanduser("~")
         else:
             target = args[0]
 
-        try:
-            result = change_directory(target)
-            print(result)
-
-        except SecurityError as exc:
-            print(f"cd: {exc}")
-
-    def command_ls(self, args: list[str]) -> None:
-
-        path = "."
-        show_hidden = False
-        recursive = False
-
-        for arg in args:
-
-            if arg in {"-a", "--all"}:
-                show_hidden = True
-
-            elif arg in {"-r", "--recursive"}:
-                recursive = True
-
-            elif not arg.startswith("-"):
-                path = arg
-
-        try:
-            entries = list_directory(
-                path,
-                show_hidden=show_hidden,
-                recursive=recursive,
+        if not os.path.isabs(target):
+            target = os.path.join(
+                self.session.cwd,
+                target,
             )
 
-            for entry in entries:
-
-                marker = (
-                    "<DIR>"
-                    if entry.is_directory
-                    else "     "
-                )
-
-                print(
-                    f"{marker:5} "
-                    f"{entry.size:>10} "
-                    f"{entry.name}"
-                )
-
-        except SecurityError as exc:
-            print(f"ls: {exc}")
-
-    # ------------------------------------------------------------------
-    # FILE COMMANDS
-    # ------------------------------------------------------------------
-
-    def command_mkdir(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: mkdir <path>")
-            return
-
-        try:
-            for path in args:
-                result = make_directory(path)
-                print(f"Created: {result}")
-
-        except Exception as exc:
-            print(f"mkdir: {exc}")
-
-    def command_touch(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: touch <file>")
-            return
-
-        try:
-            for path in args:
-                result = touch_file(path)
-                print(f"Created: {result}")
-
-        except Exception as exc:
-            print(f"touch: {exc}")
-
-    def command_cat(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: cat <file>")
-            return
-
-        try:
-            for path in args:
-                print(read_file(path))
-
-        except Exception as exc:
-            print(f"cat: {exc}")
-
-    def command_write(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: write <file> <text>")
-            return
-
-        path = args[0]
-        content = " ".join(args[1:])
-
-        confirmed = self._confirm(
-            f"Overwrite '{path}' if it already exists?"
+        target = os.path.abspath(
+            os.path.expanduser(target)
         )
 
-        try:
-            result = write_file(
-                path,
-                content,
-                confirmed=confirmed,
-            )
-
-            print(f"Written: {result}")
-
-        except Exception as exc:
-            print(f"write: {exc}")
-
-    def command_append(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: append <file> <text>")
+        if not os.path.isdir(target):
+            print(f"cd: directory not found: {target}")
             return
 
-        path = args[0]
-        content = " ".join(args[1:])
+        # IMPORTANT:
+        # Do not call os.chdir().
+        #
+        # Each Convexity session owns its own cwd.
+
+        self.session.cwd = target
+
+    # ========================================================
+    # HISTORY
+    # ========================================================
+
+    def command_history(self, args: list[str]) -> None:
 
         try:
-            result = append_file(
-                path,
-                content,
-                confirmed=self._confirm(
-                    f"Append to '{path}'?"
-                ),
-            )
+            history = self.session.get_history()
 
-            print(f"Updated: {result}")
+        except AttributeError:
+            history = []
 
-        except Exception as exc:
-            print(f"append: {exc}")
-
-    def command_rm(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: rm <path> [--recursive]")
+        if not history:
+            print("No history.")
             return
 
-        recursive = False
-        paths = []
+        limit = None
 
-        for arg in args:
-
-            if arg in {"-r", "-R", "--recursive"}:
-                recursive = True
-            else:
-                paths.append(arg)
-
-        if not paths:
-            print("Usage: rm <path>")
-            return
-
-        for path in paths:
-
-            confirmed = self._confirm(
-                f"Delete '{path}'"
-                + (" recursively?" if recursive else "?")
-            )
-
-            if not confirmed:
-                print("Cancelled.")
-                continue
-
+        if args:
             try:
-                result = delete_path(
-                    path,
-                    recursive=recursive,
-                    confirmed=True,
+                limit = int(args[0])
+            except ValueError:
+                print("history: expected a number.")
+                return
+
+        if limit is not None:
+            history = history[-limit:]
+
+        for index, entry in enumerate(history, 1):
+
+            if isinstance(entry, dict):
+                command = entry.get(
+                    "command",
+                    "",
+                )
+            else:
+                command = getattr(
+                    entry,
+                    "command",
+                    str(entry),
                 )
 
-                if result:
-                    print(f"Deleted: {path}")
-                else:
-                    print(f"Not found: {path}")
+            print(f"{index:4}  {command}")
 
-            except Exception as exc:
-                print(f"rm: {exc}")
-
-    def command_copy(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: cp <source> <destination>")
-            return
-
-        try:
-            result = copy_path(
-                args[0],
-                args[1],
-                overwrite=False,
-            )
-
-            print(f"Copied to: {result}")
-
-        except Exception as exc:
-            print(f"cp: {exc}")
-
-    def command_move(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: mv <source> <destination>")
-            return
-
-        try:
-            result = move_path(
-                args[0],
-                args[1],
-                overwrite=False,
-            )
-
-            print(f"Moved to: {result}")
-
-        except Exception as exc:
-            print(f"mv: {exc}")
-
-    def command_rename(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: rename <path> <new-name>")
-            return
-
-        try:
-            result = rename_path(
-                args[0],
-                args[1],
-                confirmed=self._confirm(
-                    f"Rename '{args[0]}'?"
-                ),
-            )
-
-            print(f"Renamed to: {result}")
-
-        except Exception as exc:
-            print(f"rename: {exc}")
-
-    # ------------------------------------------------------------------
-    # SEARCH
-    # ------------------------------------------------------------------
-
-    def command_find(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: find <path> [pattern]")
-            return
-
-        path = args[0]
-        pattern = args[1] if len(args) > 1 else "*"
-
-        try:
-            results = search_files(
-                path,
-                pattern,
-            )
-
-            for result in results:
-                print(result)
-
-            print(f"\n{len(results)} result(s).")
-
-        except Exception as exc:
-            print(f"find: {exc}")
-
-    def command_grep(self, args: list[str]) -> None:
-
-        if len(args) < 2:
-            print("Usage: grep <path> <text>")
-            return
-
-        path = args[0]
-        text = " ".join(args[1:])
-
-        try:
-            results = find_text(
-                path,
-                text,
-            )
-
-            for file_path, line, content in results:
-                print(
-                    f"{file_path}:{line}: {content}"
-                )
-
-            print(f"\n{len(results)} match(es).")
-
-        except Exception as exc:
-            print(f"grep: {exc}")
-
-    # ------------------------------------------------------------------
-    # INFORMATION
-    # ------------------------------------------------------------------
-
-    def command_exists(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: exists <path>")
-            return
-
-        for path in args:
-            print(
-                f"{path}: "
-                f"{'True' if exists(path) else 'False'}"
-            )
-
-    def command_info(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: stat <path>")
-            return
-
-        try:
-            info = get_file_info(args[0])
-
-            print(f"Path:        {info.path}")
-            print(f"Name:        {info.name}")
-            print(f"Type:        {info.type}")
-            print(f"Size:        {info.size} bytes")
-            print(f"Permissions: {info.permissions}")
-            print(f"Modified:    {info.modified}")
-            print(f"Hidden:      {info.hidden}")
-
-        except Exception as exc:
-            print(f"stat: {exc}")
-
-    def command_size(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: size <path>")
-            return
-
-        try:
-            print(
-                f"{get_directory_size(args[0]):,} bytes"
-            )
-
-        except Exception as exc:
-            print(f"size: {exc}")
-
-    # ------------------------------------------------------------------
-    # PROCESSES
-    # ------------------------------------------------------------------
-
-    def command_processes(self) -> None:
-
-        processes = list_processes()
-
-        if not processes:
-            print("No Convexity background processes.")
-            return
-
-        for process in processes:
-
-            status = (
-                "running"
-                if process.running
-                else f"exit={process.return_code}"
-            )
-
-            print(
-                f"{process.pid:<8} "
-                f"{status:<12} "
-                f"{process.command}"
-            )
-
-    def command_background(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: bg <command>")
-            return
-
-        command = " ".join(
-            shlex.quote(arg)
-            for arg in args
-        )
-
-        result = start_background(command)
-
-        print(result.stdout or result.stderr)
-
-    def command_kill(self, args: list[str]) -> None:
-
-        if not args:
-            print("Usage: kill <pid>")
-            return
-
-        try:
-            pid = int(args[0])
-
-        except ValueError:
-            print("kill: PID must be a number.")
-            return
-
-        if not self._confirm(
-            f"Terminate process {pid}?"
-        ):
-            print("Cancelled.")
-            return
-
-        if terminate_process(pid):
-            print(f"Process {pid} terminated.")
-        else:
-            print(f"Unable to terminate process {pid}.")
-
-    # ------------------------------------------------------------------
+    # ========================================================
     # ENVIRONMENT
-    # ------------------------------------------------------------------
+    # ========================================================
 
     def command_env(self) -> None:
 
-        for key in sorted(os.environ):
-            print(
-                f"{key}={os.environ[key]}"
-            )
+        environment = self.session.environment
+
+        for key in sorted(environment):
+            print(f"{key}={environment[key]}")
+
+    # ========================================================
+    # SET
+    # ========================================================
 
     def command_set(self, args: list[str]) -> None:
 
@@ -783,25 +443,229 @@ to the execution engine.
             return
 
         name = args[0]
+
         value = " ".join(args[1:])
 
-        os.environ[name] = value
-
-        print(
-            f"{name}={value}"
+        self.session.set_environment(
+            name,
+            value,
         )
+
+    # ========================================================
+    # UNSET
+    # ========================================================
 
     def command_unset(self, args: list[str]) -> None:
 
-        if not args:
+        if len(args) != 1:
             print("Usage: unset <name>")
             return
 
-        for name in args:
-            os.environ.pop(
-                name,
-                None,
+        self.session.remove_environment(
+            args[0]
+        )
+
+    # ========================================================
+    # MAPLE
+    # ========================================================
+
+    def command_load_maple(self) -> None:
+
+        try:
+            if self.session.is_maple_loaded():
+                print("Maple is already loaded.")
+                return
+
+            self.session.load_maple()
+
+            print("Maple loaded.")
+            print(
+                "Maple will remain active until "
+                "'kill maple' is used."
             )
 
-    # ------------------------------------------------------------------
-    # EXTERNAL COM
+        except Exception as exc:
+            print(f"Maple: unable to load: {exc}")
+
+    def command_kill_maple(self) -> None:
+
+        try:
+            if not self.session.is_maple_loaded():
+                print("Maple is not loaded.")
+                return
+
+            self.session.kill_maple()
+
+            print("Maple unloaded.")
+
+        except Exception as exc:
+            print(f"Maple: unable to unload: {exc}")
+
+    # ========================================================
+    # SYSTEM INFORMATION
+    # ========================================================
+
+    def command_sysinfo(self) -> None:
+
+        print(f"System:      {platform.system()}")
+        print(f"Release:     {platform.release()}")
+        print(f"Version:     {platform.version()}")
+        print(f"Machine:     {platform.machine()}")
+        print(f"Processor:   {platform.processor()}")
+        print(f"Python:      {platform.python_version()}")
+        print(f"Directory:   {self.session.cwd}")
+
+        try:
+            print(
+                f"Maple:       "
+                f"{'loaded' if self.session.is_maple_loaded() else 'inactive'}"
+            )
+        except Exception:
+            pass
+
+    # ========================================================
+    # PROCESSES
+    # ========================================================
+
+    def command_processes(self) -> None:
+
+        try:
+            processes = self.runtime.executor.list_processes()
+
+        except AttributeError:
+            print("Process information unavailable.")
+            return
+
+        if not processes:
+            print("No active processes.")
+            return
+
+        print(
+            f"{'PID':>8}  "
+            f"{'STATE':<12}  "
+            f"COMMAND"
+        )
+
+        print("-" * 60)
+
+        for process in processes:
+
+            pid = getattr(
+                process,
+                "pid",
+                "?",
+            )
+
+            state = getattr(
+                process,
+                "state",
+                "unknown",
+            )
+
+            command = getattr(
+                process,
+                "command",
+                "",
+            )
+
+            print(
+                f"{str(pid):>8}  "
+                f"{str(state):<12}  "
+                f"{command}"
+            )
+
+    # ========================================================
+    # EXTERNAL COMMAND
+    # ========================================================
+
+    def command_external(self, command: str) -> None:
+        """
+        Execute an external command through Runtime.
+
+        Runtime is the only execution path.
+        """
+
+        source = "human"
+
+        # ----------------------------------------------------
+        # Maple is not itself executed here.
+        #
+        # If a future Maple agent requests execution, it should
+        # call Runtime with source="maple" and confirmed=True
+        # after approval.
+        # ----------------------------------------------------
+
+        result = self.runtime.execute(
+            self.session_id,
+            command,
+            source=source,
+            confirmed=False,
+        )
+
+        if result.stdout:
+            print(
+                result.stdout,
+                end=""
+                if result.stdout.endswith("\n")
+                else "\n",
+            )
+
+        if result.stderr:
+            print(
+                result.stderr,
+                file=sys.stderr,
+                end=""
+                if result.stderr.endswith("\n")
+                else "\n",
+            )
+
+    # ========================================================
+    # BACKGROUND COMMAND
+    # ========================================================
+
+    def execute_background(
+        self,
+        command: str,
+    ):
+        """
+        Start a background command through Runtime.
+        """
+
+        return self.runtime.execute_background(
+            self.session_id,
+            command,
+            source="human",
+            confirmed=False,
+        )
+
+
+# ============================================================
+# CONVENIENCE ENTRY POINT
+# ============================================================
+
+def create_terminal() -> ConvexityTerminal:
+    """
+    Create a Convexity terminal instance.
+    """
+
+    return ConvexityTerminal()
+
+
+def main() -> None:
+    """
+    Main executable entry point.
+    """
+
+    terminal = create_terminal()
+
+    try:
+        terminal.run()
+
+    finally:
+        # Do not forcibly close the global runtime here.
+        # Other Convexity components may still be using it.
+        pass
+
+
+if __name__ == "__main__":
+    main()
