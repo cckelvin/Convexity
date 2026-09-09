@@ -1,8 +1,8 @@
 """
 Convexity Native Shell Engine
-Version 0.3.0
+Version 1.0.0
 
-Convexity's own shell parser.
+Convexity's native command parser and shell orchestrator.
 
 Supported:
     command
@@ -15,32 +15,43 @@ Supported:
     command ; command
     command &
 
-Quoted arguments are supported.
+The shell does NOT use:
+    shell=True
+    os.system()
+    subprocess.Popen()
 
-This module does NOT use shell=True.
-Every executable command is still routed through Convexity's
-security and execution layers.
+Executable execution is delegated to terminal.executor.py.
+
+Session cwd is passed explicitly instead of changing the process-wide cwd.
 """
 
 from __future__ import annotations
 
 import os
-import shlex
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .config import config
 from .executor import (
     ExecutionResult,
     execute_command,
     execute_pipeline,
     start_background,
 )
+from .filesystem import (
+    read_file,
+    write_file,
+)
+from .security import (
+    SecurityError,
+    split_shell_segments,
+    tokenize_command,
+)
 
 
-# ---------------------------------------------------------------------------
-# TOKEN TYPES
-# ---------------------------------------------------------------------------
+# ============================================================================
+# OPERATORS
+# ============================================================================
+
 
 OPERATORS = (
     "&&",
@@ -54,13 +65,20 @@ OPERATORS = (
 )
 
 
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+
 @dataclass
 class ShellCommand:
-    """One parsed shell command."""
+    """One parsed command."""
 
     command: str
+
     stdin: Optional[str] = None
     stdout: Optional[str] = None
+
     append_stdout: bool = False
     background: bool = False
 
@@ -73,33 +91,32 @@ class ShellExpression:
     operators: List[str]
 
 
-# ---------------------------------------------------------------------------
-# LEXER
-# ---------------------------------------------------------------------------
+# ============================================================================
+# TOKENIZER
+# ============================================================================
+
 
 def tokenize_shell(command: str) -> List[str]:
     """
-    Convert shell text into tokens while preserving operators.
+    Tokenize shell text while preserving shell operators.
 
-    Example:
+    Examples:
 
-        echo "hello world" | grep hello > result.txt
+        echo hello | grep hello
 
-    becomes approximately:
-
-        echo
-        hello world
-        |
-        grep
-        hello
-        >
-        result.txt
+        echo "hello world" > result.txt
     """
 
-    if not command or not command.strip():
+    if not isinstance(command, str):
+        raise ValueError(
+            "Command must be a string."
+        )
+
+    if not command.strip():
         return []
 
     tokens: List[str] = []
+
     current: List[str] = []
 
     quote: Optional[str] = None
@@ -112,7 +129,7 @@ def tokenize_shell(command: str) -> List[str]:
         char = command[index]
 
         # --------------------------------------------------------------
-        # ESCAPING
+        # ESCAPE
         # --------------------------------------------------------------
 
         if escaped:
@@ -129,7 +146,7 @@ def tokenize_shell(command: str) -> List[str]:
             continue
 
         # --------------------------------------------------------------
-        # QUOTES
+        # QUOTE
         # --------------------------------------------------------------
 
         if quote:
@@ -155,17 +172,19 @@ def tokenize_shell(command: str) -> List[str]:
         if char.isspace():
 
             if current:
-                tokens.append("".join(current))
+                tokens.append(
+                    "".join(current)
+                )
                 current = []
 
             index += 1
             continue
 
         # --------------------------------------------------------------
-        # OPERATORS
+        # OPERATOR
         # --------------------------------------------------------------
 
-        matched_operator = None
+        matched = None
 
         for operator in OPERATORS:
 
@@ -173,18 +192,20 @@ def tokenize_shell(command: str) -> List[str]:
                 operator,
                 index,
             ):
-                matched_operator = operator
+                matched = operator
                 break
 
-        if matched_operator:
+        if matched:
 
             if current:
-                tokens.append("".join(current))
+                tokens.append(
+                    "".join(current)
+                )
                 current = []
 
-            tokens.append(matched_operator)
+            tokens.append(matched)
 
-            index += len(matched_operator)
+            index += len(matched)
             continue
 
         # --------------------------------------------------------------
@@ -203,18 +224,26 @@ def tokenize_shell(command: str) -> List[str]:
         )
 
     if current:
-        tokens.append("".join(current))
+        tokens.append(
+            "".join(current)
+        )
 
     return tokens
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # PARSER
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def parse_shell(command: str) -> ShellExpression:
+
+def parse_shell(
+    command: str,
+) -> ShellExpression:
     """
     Parse a Convexity shell expression.
+
+    The parser keeps commands as executable command strings while storing
+    redirections and shell operators separately.
     """
 
     tokens = tokenize_shell(command)
@@ -228,23 +257,23 @@ def parse_shell(command: str) -> ShellExpression:
     commands: List[ShellCommand] = []
     operators: List[str] = []
 
-    current_tokens: List[str] = []
+    current: List[str] = []
 
     stdin_file: Optional[str] = None
     stdout_file: Optional[str] = None
+
     append_stdout = False
     background = False
 
-    index = 0
-
     def finish_command() -> None:
-        nonlocal current_tokens
+
+        nonlocal current
         nonlocal stdin_file
         nonlocal stdout_file
         nonlocal append_stdout
         nonlocal background
 
-        if not current_tokens:
+        if not current:
             raise ValueError(
                 "Missing command."
             )
@@ -252,8 +281,8 @@ def parse_shell(command: str) -> ShellExpression:
         commands.append(
             ShellCommand(
                 command=" ".join(
-                    shlex.quote(token)
-                    for token in current_tokens
+                    _quote_argument(token)
+                    for token in current
                 ),
                 stdin=stdin_file,
                 stdout=stdout_file,
@@ -262,18 +291,22 @@ def parse_shell(command: str) -> ShellExpression:
             )
         )
 
-        current_tokens = []
+        current = []
+
         stdin_file = None
         stdout_file = None
+
         append_stdout = False
         background = False
+
+    index = 0
 
     while index < len(tokens):
 
         token = tokens[index]
 
         # --------------------------------------------------------------
-        # PIPE / CONDITIONAL OPERATORS
+        # COMMAND OPERATORS
         # --------------------------------------------------------------
 
         if token in {
@@ -296,12 +329,20 @@ def parse_shell(command: str) -> ShellExpression:
 
         if token == "&":
 
+            if not current:
+                raise ValueError(
+                    "Missing command before '&'."
+                )
+
             background = True
 
-            # Background marker normally terminates command.
             finish_command()
 
-            if index + 1 < len(tokens):
+            # Background separates commands.
+            if (
+                index + 1 < len(tokens)
+                and tokens[index + 1] != "&"
+            ):
                 operators.append(";")
 
             index += 1
@@ -313,7 +354,15 @@ def parse_shell(command: str) -> ShellExpression:
 
         if token == "<":
 
-            if index + 1 >= len(tokens):
+            if not current:
+                raise ValueError(
+                    "Missing command before '<'."
+                )
+
+            if (
+                index + 1 >= len(tokens)
+                or tokens[index + 1] in OPERATORS
+            ):
                 raise ValueError(
                     "Missing input file after '<'."
                 )
@@ -332,14 +381,24 @@ def parse_shell(command: str) -> ShellExpression:
             ">>",
         }:
 
-            if index + 1 >= len(tokens):
+            if not current:
+                raise ValueError(
+                    f"Missing command before '{token}'."
+                )
+
+            if (
+                index + 1 >= len(tokens)
+                or tokens[index + 1] in OPERATORS
+            ):
                 raise ValueError(
                     f"Missing output file after '{token}'."
                 )
 
             stdout_file = tokens[index + 1]
 
-            append_stdout = token == ">>"
+            append_stdout = (
+                token == ">>"
+            )
 
             index += 2
             continue
@@ -348,11 +407,11 @@ def parse_shell(command: str) -> ShellExpression:
         # NORMAL TOKEN
         # --------------------------------------------------------------
 
-        current_tokens.append(token)
+        current.append(token)
 
         index += 1
 
-    if current_tokens:
+    if current:
         finish_command()
 
     if len(operators) >= len(commands):
@@ -366,61 +425,210 @@ def parse_shell(command: str) -> ShellExpression:
     )
 
 
-# ---------------------------------------------------------------------------
+def _quote_argument(
+    value: str,
+) -> str:
+    """
+    Quote an argument so it can safely be passed back through Convexity's
+    parser.
+    """
+
+    if value == "":
+        return '""'
+
+    safe = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "_-./:@+,%"
+    )
+
+    if all(
+        char in safe
+        for char in value
+    ):
+        return value
+
+    escaped = value.replace(
+        "\\",
+        "\\\\",
+    ).replace(
+        '"',
+        '\\"',
+    )
+
+    return f'"{escaped}"'
+
+
+# ============================================================================
 # REDIRECTION
-# ---------------------------------------------------------------------------
-
-def _read_stdin(path: str) -> str:
-
-    with open(
-        os.path.expanduser(path),
-        "r",
-        encoding="utf-8",
-        errors="replace",
-    ) as file:
-
-        return file.read()
+# ============================================================================
 
 
-def _write_stdout(
+def _resolve_redirection_path(
+    path: str,
+    cwd: Optional[str],
+) -> str:
+    """
+    Resolve a redirection path relative to the shell session cwd.
+
+    This does not change the global process cwd.
+    """
+
+    if os.path.isabs(path):
+        return path
+
+    base = (
+        cwd
+        if cwd is not None
+        else os.getcwd()
+    )
+
+    return os.path.abspath(
+        os.path.join(
+            base,
+            path,
+        )
+    )
+
+
+def _read_input(
+    path: str,
+    *,
+    cwd: Optional[str],
+) -> str:
+    """Read shell input redirection."""
+
+    resolved = _resolve_redirection_path(
+        path,
+        cwd,
+    )
+
+    return read_file(
+        resolved,
+    )
+
+
+def _write_output(
     path: str,
     output: str,
     *,
+    cwd: Optional[str],
     append: bool,
+    source: str,
+    confirmed: bool,
 ) -> None:
+    """Write shell output redirection."""
 
-    destination = os.path.expanduser(path)
-
-    parent = os.path.dirname(
-        os.path.abspath(destination)
+    resolved = _resolve_redirection_path(
+        path,
+        cwd,
     )
 
-    if parent:
-        os.makedirs(
-            parent,
-            exist_ok=True,
+    if append:
+        from .filesystem import append_file
+
+        append_file(
+            resolved,
+            output,
+            source=source,
+            confirmed=confirmed,
         )
 
-    mode = "a" if append else "w"
+    else:
+        write_file(
+            resolved,
+            output,
+            overwrite=True,
+            source=source,
+            confirmed=confirmed,
+        )
 
-    with open(
-        destination,
-        mode,
-        encoding="utf-8",
-    ) as file:
 
-        file.write(output)
+# ============================================================================
+# RESULT HELPERS
+# ============================================================================
 
 
-# ---------------------------------------------------------------------------
-# EXECUTION
-# ---------------------------------------------------------------------------
+def _error_result(
+    command: str,
+    message: str,
+    *,
+    return_code: int = 2,
+) -> ExecutionResult:
+    """Create a failed execution result."""
+
+    return ExecutionResult(
+        success=False,
+        stdout="",
+        stderr=message,
+        return_code=return_code,
+        command=command,
+    )
+
+
+def _combine_results(
+    results: List[ExecutionResult],
+    command: str,
+) -> ExecutionResult:
+    """Combine multiple shell results."""
+
+    if not results:
+        return _error_result(
+            command,
+            "No command executed.",
+            return_code=1,
+        )
+
+    last = results[-1]
+
+    stdout_parts = []
+    stderr_parts = []
+
+    for result in results:
+
+        if result.stdout:
+            stdout_parts.append(
+                result.stdout
+            )
+
+        if result.stderr:
+            stderr_parts.append(
+                result.stderr
+            )
+
+    last.stdout = "\n".join(
+        stdout_parts
+    )
+
+    last.stderr = "\n".join(
+        stderr_parts
+    )
+
+    return last
+
+
+# ============================================================================
+# SHELL ENGINE
+# ============================================================================
+
 
 class ConvexityShell:
-    """Native Convexity shell."""
+    """
+    Convexity's native shell.
+
+    The shell itself is not a process manager. It delegates actual process
+    execution to executor.py.
+    """
 
     def __init__(self) -> None:
-        self.environment = dict(os.environ)
+        self.environment = dict(
+            os.environ
+        )
+
+    # ------------------------------------------------------------------
+    # EXECUTE
+    # ------------------------------------------------------------------
 
     def execute(
         self,
@@ -430,38 +638,64 @@ class ConvexityShell:
         source: str = "human",
         confirmed: bool = False,
     ) -> ExecutionResult:
+        """Parse and execute a shell expression."""
+
+        if not isinstance(
+            command,
+            str,
+        ):
+            return _error_result(
+                "",
+                "Command must be a string.",
+            )
+
+        if not command.strip():
+            return _error_result(
+                command,
+                "Empty command.",
+            )
 
         try:
 
-            expression = parse_shell(command)
+            expression = parse_shell(
+                command
+            )
 
-        except ValueError as exc:
+        except (
+            ValueError,
+            SecurityError,
+        ) as exc:
 
-            return ExecutionResult(
-                success=False,
-                stderr=f"Shell syntax error: {exc}",
-                return_code=2,
-                command=command,
+            return _error_result(
+                command,
+                f"Shell syntax error: {exc}",
             )
 
         if not expression.commands:
-
-            return ExecutionResult(
-                success=False,
-                stderr="Empty command.",
-                return_code=2,
-                command=command,
+            return _error_result(
+                command,
+                "Empty command.",
             )
 
-        return self._execute_expression(
-            expression,
-            cwd=cwd,
-            source=source,
-            confirmed=confirmed,
-        )
+        try:
+
+            return self._execute_expression(
+                expression,
+                cwd=cwd,
+                source=source,
+                confirmed=confirmed,
+            )
+
+        except SecurityError as exc:
+
+            return _error_result(
+                command,
+                str(exc),
+                return_code=1,
+            )
 
     # ------------------------------------------------------------------
-    # EXPRESSION EXECUTION
+    # EXPRESSION
     # ------------------------------------------------------------------
 
     def _execute_expression(
@@ -473,33 +707,44 @@ class ConvexityShell:
         confirmed: bool,
     ) -> ExecutionResult:
 
-        previous_result: Optional[
+        results: List[
             ExecutionResult
-        ] = None
+        ] = []
 
-        for index, shell_command in enumerate(
+        index = 0
+
+        while index < len(
             expression.commands
         ):
 
+            shell_command = (
+                expression.commands[index]
+            )
+
             # ----------------------------------------------------------
-            # CONDITIONAL EXECUTION
+            # CONDITIONALS
             # ----------------------------------------------------------
 
-            if (
-                previous_result is not None
-                and index > 0
-            ):
+            if index > 0:
 
-                operator = expression.operators[
-                    index - 1
-                ]
+                operator = (
+                    expression.operators[
+                        index - 1
+                    ]
+                )
+
+                previous = results[-1]
 
                 if operator == "&&":
-                    if not previous_result.success:
+
+                    if not previous.success:
+                        index += 1
                         continue
 
                 elif operator == "||":
-                    if previous_result.success:
+
+                    if previous.success:
+                        index += 1
                         continue
 
             # ----------------------------------------------------------
@@ -507,38 +752,58 @@ class ConvexityShell:
             # ----------------------------------------------------------
 
             if (
-                index < len(expression.operators)
-                and expression.operators[index] == "|"
+                index
+                < len(expression.operators)
+                and expression.operators[index]
+                == "|"
             ):
 
-                pipeline_commands = [
+                pipeline = [
                     shell_command.command
                 ]
 
-                next_index = index + 1
+                pipeline_end = index
 
                 while (
-                    next_index < len(expression.commands)
-                    and next_index - 1 < len(expression.operators)
+                    pipeline_end
+                    < len(expression.operators)
                     and expression.operators[
-                        next_index - 1
+                        pipeline_end
                     ] == "|"
                 ):
 
-                    pipeline_commands.append(
+                    next_command_index = (
+                        pipeline_end + 1
+                    )
+
+                    if (
+                        next_command_index
+                        >= len(
+                            expression.commands
+                        )
+                    ):
+                        raise ValueError(
+                            "Missing command after '|'."
+                        )
+
+                    pipeline.append(
                         expression.commands[
-                            next_index
+                            next_command_index
                         ].command
                     )
 
-                    next_index += 1
+                    pipeline_end += 1
 
-                previous_result = execute_pipeline(
-                    pipeline_commands,
+                result = execute_pipeline(
+                    pipeline,
                     cwd=cwd,
                     source=source,
                     confirmed=confirmed,
                 )
+
+                results.append(result)
+
+                index = pipeline_end + 1
 
                 continue
 
@@ -548,17 +813,21 @@ class ConvexityShell:
 
             if shell_command.background:
 
-                previous_result = start_background(
+                result = start_background(
                     shell_command.command,
                     cwd=cwd,
                     source=source,
                     confirmed=confirmed,
                 )
 
+                results.append(result)
+
+                index += 1
+
                 continue
 
             # ----------------------------------------------------------
-            # INPUT
+            # INPUT REDIRECTION
             # ----------------------------------------------------------
 
             input_data = None
@@ -566,20 +835,29 @@ class ConvexityShell:
             if shell_command.stdin:
 
                 try:
-                    input_data = _read_stdin(
-                        shell_command.stdin
+
+                    input_data = _read_input(
+                        shell_command.stdin,
+                        cwd=cwd,
                     )
 
-                except OSError as exc:
+                except (
+                    OSError,
+                    SecurityError,
+                ) as exc:
 
-                    previous_result = ExecutionResult(
-                        success=False,
-                        stderr=(
-                            f"Input redirection error: {exc}"
+                    result = _error_result(
+                        shell_command.command,
+                        (
+                            "Input redirection error: "
+                            f"{exc}"
                         ),
                         return_code=1,
-                        command=shell_command.command,
                     )
+
+                    results.append(result)
+
+                    index += 1
 
                     continue
 
@@ -587,12 +865,29 @@ class ConvexityShell:
             # EXECUTE
             # ----------------------------------------------------------
 
-            previous_result = execute_command(
+            result = execute_command(
                 shell_command.command,
                 cwd=cwd,
                 source=source,
                 confirmed=confirmed,
             )
+
+            # ----------------------------------------------------------
+            # INPUT NOTE
+            # ----------------------------------------------------------
+            #
+            # The canonical executor currently owns process stdin.
+            # Therefore input_data is intentionally not injected through
+            # subprocess APIs here. This keeps shell.py from bypassing
+            # executor.py.
+            #
+            # Future executor support can accept structured stdin without
+            # changing the shell parser.
+            # ----------------------------------------------------------
+
+            if input_data is not None:
+                if not result.stdout:
+                    result.stdout = ""
 
             # ----------------------------------------------------------
             # OUTPUT REDIRECTION
@@ -602,36 +897,49 @@ class ConvexityShell:
 
                 try:
 
-                    output = previous_result.stdout
-
-                    _write_stdout(
+                    _write_output(
                         shell_command.stdout,
-                        output,
-                        append=shell_command.append_stdout,
+                        result.stdout,
+                        cwd=cwd,
+                        append=(
+                            shell_command.append_stdout
+                        ),
+                        source=source,
+                        confirmed=confirmed,
                     )
 
-                    # Terminal output is consumed by redirection.
-                    previous_result.stdout = ""
+                    result.stdout = ""
 
-                except OSError as exc:
+                except (
+                    OSError,
+                    SecurityError,
+                ) as exc:
 
-                    previous_result.success = False
-                    previous_result.return_code = 1
-                    previous_result.stderr += (
-                        f"\nOutput redirection error: {exc}"
+                    result.success = False
+                    result.return_code = 1
+
+                    if result.stderr:
+                        result.stderr += "\n"
+
+                    result.stderr += (
+                        "Output redirection error: "
+                        f"{exc}"
                     )
 
-        return previous_result or ExecutionResult(
-            success=False,
-            stderr="No command executed.",
-            return_code=1,
-            command="",
+            results.append(result)
+
+            index += 1
+
+        return _combine_results(
+            results,
+            "shell expression",
         )
 
 
-# ---------------------------------------------------------------------------
-# GLOBAL SHELL
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GLOBAL SHELL INSTANCE
+# ============================================================================
+
 
 shell = ConvexityShell()
 
@@ -643,6 +951,9 @@ def execute_shell(
     source: str = "human",
     confirmed: bool = False,
 ) -> ExecutionResult:
+    """
+    Convenience wrapper around the global Convexity shell.
+    """
 
     return shell.execute(
         command,
@@ -652,11 +963,18 @@ def execute_shell(
     )
 
 
+# ============================================================================
+# PUBLIC API
+# ============================================================================
+
+
 __all__ = [
+    "OPERATORS",
     "ShellCommand",
     "ShellExpression",
     "tokenize_shell",
     "parse_shell",
     "ConvexityShell",
+    "shell",
     "execute_shell",
 ]
